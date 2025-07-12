@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import random
 from cashier.cashier_handler import CashierHandler
+import psycopg2
 
 cashier_handler = CashierHandler()
 
@@ -27,8 +28,8 @@ def random_cart(cat_df, min_items=2, max_items=6, min_qty=1, max_qty=5):
     return cart
 
 def display_bulk_test():
-    st.title("🧪 Bulk POS Sale Simulation Test (REAL TABLES, SAFE LOGIC)")
-    st.info("Simulate many sales using the exact cashier logic: all stock, shortages, and sales tables are updated using the POS business logic. Test sales are tagged in the notes.")
+    st.title("🧪 Bulk POS Sale Simulation Test (Handles Errors, No Table Edits)")
+    st.info("Simulate many sales using the POS logic. Any DB errors (including PK/unique issues) are reported and skipped.")
 
     cat_df = get_item_catalogue()
     total_items = len(cat_df)
@@ -49,18 +50,26 @@ def display_bulk_test():
         with st.spinner("Running bulk test..."):
             for i in range(int(num_sales)):
                 cart = random_cart(cat_df, min_items, max_items, min_qty, max_qty)
-                # Use the same method as your POS
-                saleid, shortages = cashier_handler.process_sale_with_shortage(
-                    cart_items=cart,
-                    discount_rate=0.0,        # set discount to 0 for simplicity
-                    payment_method=pay_method,
-                    cashier="BULKTEST",
-                    notes=f"[BULK TEST] {note}".strip()
-                )
-                if saleid:
-                    msg = f"✅ Sale #{saleid} OK"
-                else:
-                    msg = f"❌ Sale failed"
+                try:
+                    saleid, shortages = cashier_handler.process_sale_with_shortage(
+                        cart_items=cart,
+                        discount_rate=0.0,
+                        payment_method=pay_method,
+                        cashier="BULKTEST",
+                        notes=f"[BULK TEST] {note}".strip()
+                    )
+                    if saleid:
+                        msg = f"✅ Sale #{saleid} OK"
+                    else:
+                        msg = f"❌ Sale failed"
+                except psycopg2.errors.UniqueViolation as e:
+                    msg = f"❌ UniqueViolation (skipped): {e}"
+                    saleid = None
+                    shortages = []
+                except Exception as e:
+                    msg = f"❌ DB error: {e}"
+                    saleid = None
+                    shortages = []
                 results.append({
                     "sale": i + 1,
                     "sale_id": saleid,
