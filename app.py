@@ -1,21 +1,23 @@
 import streamlit as st
 import pandas as pd
-from cashier.cashier_handler import CashierHandler
+from datetime import datetime
 
-cashier_handler = CashierHandler()
+from db_handler import DatabaseManager  # Adjust this import to your path
 
+# --- Initialize DB connection
+db = DatabaseManager()
+
+# --- Helpers: catalogue
 @st.cache_data(ttl=600)
 def get_item_catalogue():
-    return cashier_handler.fetch_data(
-        """
+    return db.fetch_data("""
         SELECT itemid, itemnameenglish AS itemname, sellingprice,
                COALESCE(barcode,'') AS barcode,
                COALESCE(packetbarcode,'') AS packetbarcode,
                COALESCE(cartonbarcode,'') AS cartonbarcode,
                packetsize, cartonsize
         FROM item
-        """
-    )
+    """)
 
 def build_lookup(cat_df: pd.DataFrame):
     idx = {}
@@ -58,35 +60,48 @@ def clear_test_bill():
         columns=["barcode", "itemid", "itemname", "quantity", "price", "total"]
     )
 
-def finalize_test_sale(method, disc_rate, subtotal, disc_amt, final_amt, note):
-    df = st.session_state.test_sales_table
-    if df.empty:
-        st.error("Test bill is empty."); return
-    cart_items = [
-        {"itemid": int(r.itemid),
-         "quantity": int(r.quantity),
-         "sellingprice": float(r.price)}
-        for _, r in df.iterrows()
-    ]
-    res = cashier_handler.process_sale_with_shortage(
-        cart_items       = cart_items,
-        discount_rate    = disc_rate,
-        payment_method   = method,
-        cashier          = st.session_state.get("user_email", "TestSim"),
-        notes            = f"SIMULATED SALE | {note} | Sub {subtotal:.2f} | Disc {disc_amt:.2f} | Final {final_amt:.2f}"
-    )
-    if not res:
-        st.error("Simulated sale failed."); return
-    sale_id, shortages = res
-    st.success(f"✅ Simulated sale completed! ID {sale_id}")
-    if shortages:
-        for s in shortages:
-            st.warning(f"⚠ Shortage: {s['itemname']} (−{s['qty']})")
-    clear_test_bill()
+# --- Sale simulation logic
+def simulate_sale(cart_items, disc_rate, subtotal, disc_amt, final_amt, note, payment_method):
+    # Simulate sale as inserting into a `sale` table (or use your actual POS logic!)
+    # We'll log test sales using a special note, and update inventory if needed.
+    # You should adapt this to your actual sale logic.
+    now = datetime.utcnow()
+    try:
+        # 1. Insert into `sale` table
+        sale_sql = """
+            INSERT INTO sale (timestamp, items, discount_rate, subtotal, discount_amount, total, note, payment_method)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING saleid
+        """
+        # You may need to adjust the table/columns as per your DB schema.
+        items_json = str(cart_items)  # or json.dumps(cart_items) if your column is JSONB
+        res = db.execute_command_returning(
+            sale_sql,
+            (now, items_json, disc_rate, subtotal, disc_amt, final_amt, "[SIM TEST] " + note, payment_method)
+        )
+        sale_id = res[0] if res else None
 
+        # 2. Decrement inventory for each item (adapt this to your logic if different)
+        shortage_msgs = []
+        for itm in cart_items:
+            # You should use transactions to ensure atomicity in production!
+            update_sql = """
+                UPDATE inventory
+                SET quantity = quantity - %s
+                WHERE itemid = %s AND quantity >= %s
+            """
+            db.execute_command(update_sql, (itm['quantity'], itm['itemid'], itm['quantity']))
+            # Optionally, check for shortages or stockout (not covered here)
+
+        return sale_id, shortage_msgs
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return None, []
+
+# --- Streamlit UI
 def display_test_simulator():
     st.title("🧪 POS Sale Simulation Test")
-    st.info("Simulate cashier sales by building a test bill, then run it as a real sale using the POS backend.")
+    st.info("Simulate cashier sales by building a test bill, then run it as a real sale using your DB backend.")
 
     # Load catalogue and build lookup
     cat_df   = get_item_catalogue()
@@ -157,9 +172,21 @@ def display_test_simulator():
 
     c1, c2, c3 = st.columns(3)
     if c1.button("Simulate Sale (Cash)"):
-        finalize_test_sale("Cash", disc_rate, subtotal, disc_amt, final_amt, note)
+        cart_items = [
+            {"itemid": int(r.itemid), "quantity": int(r.quantity), "sellingprice": float(r.price)}
+            for _, r in df.iterrows()
+        ]
+        sale_id, shortages = simulate_sale(cart_items, disc_rate, subtotal, disc_amt, final_amt, note, "Cash")
+        if sale_id:
+            st.success(f"✅ Simulated sale completed! ID {sale_id}")
     if c2.button("Simulate Sale (Card)"):
-        finalize_test_sale("Card", disc_rate, subtotal, disc_amt, final_amt, note)
+        cart_items = [
+            {"itemid": int(r.itemid), "quantity": int(r.quantity), "sellingprice": float(r.price)}
+            for _, r in df.iterrows()
+        ]
+        sale_id, shortages = simulate_sale(cart_items, disc_rate, subtotal, disc_amt, final_amt, note, "Card")
+        if sale_id:
+            st.success(f"✅ Simulated sale completed! ID {sale_id}")
     if c3.button("Clear Test Bill"):
         clear_test_bill()
 
