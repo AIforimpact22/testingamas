@@ -1,74 +1,34 @@
 import streamlit as st
 import pandas as pd
 import random
-from datetime import datetime
-from db_handler import DatabaseManager  # Adjust this path to your handler
+from cashier.cashier_handler import CashierHandler
 
-db = DatabaseManager()
+cashier_handler = CashierHandler()
 
 @st.cache_data(ttl=600)
 def get_item_catalogue():
-    return db.fetch_data("""
-        SELECT itemid, itemnameenglish AS itemname, sellingprice,
-               COALESCE(barcode,'') AS barcode,
-               COALESCE(packetbarcode,'') AS packetbarcode,
-               COALESCE(cartonbarcode,'') AS cartonbarcode,
-               packetsize, cartonsize
+    return cashier_handler.fetch_data("""
+        SELECT itemid, itemnameenglish AS itemname, sellingprice
         FROM item
+        WHERE sellingprice IS NOT NULL AND sellingprice > 0
     """)
 
 def random_cart(cat_df, min_items=2, max_items=6, min_qty=1, max_qty=5):
-    n_items = random.randint(min_items, max_items)
-    picks = cat_df.sample(n=min(n_items, len(cat_df)), replace=False)
+    n_items = random.randint(min_items, min(max_items, len(cat_df)))
+    picks = cat_df.sample(n=n_items, replace=False)
     cart = []
     for _, row in picks.iterrows():
         qty = random.randint(min_qty, max_qty)
         cart.append({
             "itemid": int(row.itemid),
-            "itemname": row.itemname,
             "quantity": qty,
-            "sellingprice": float(row.sellingprice or 0.0)
+            "sellingprice": float(row.sellingprice)
         })
     return cart
 
-def simulate_bulk_sale(cart_items, note, payment_method):
-    now = datetime.utcnow()
-    subtotal = sum(i["quantity"] * i["sellingprice"] for i in cart_items)
-    disc_rate = 0.0  # No discount for bulk test, change if you want randomness
-    disc_amt = 0.0
-    final_amt = subtotal - disc_amt
-    try:
-        # Insert into sale table (adjust as needed)
-        sale_sql = """
-            INSERT INTO sale (timestamp, items, discount_rate, subtotal, discount_amount, total, note, payment_method)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING saleid
-        """
-        items_json = str(cart_items)  # or json.dumps(cart_items)
-        res = db.execute_command_returning(
-            sale_sql,
-            (now, items_json, disc_rate, subtotal, disc_amt, final_amt, "[BULK TEST] " + note, payment_method)
-        )
-        sale_id = res[0] if res else None
-
-        # Decrement inventory for each item (same logic as in a real sale)
-        shortage_msgs = []
-        for itm in cart_items:
-            update_sql = """
-                UPDATE inventory
-                SET quantity = quantity - %s
-                WHERE itemid = %s AND quantity >= %s
-            """
-            db.execute_command(update_sql, (itm['quantity'], itm['itemid'], itm['quantity']))
-            # Optional: check for out-of-stock, log shortages if needed
-
-        return sale_id, shortage_msgs
-    except Exception as e:
-        return None, [f"DB error: {e}"]
-
 def display_bulk_test():
-    st.title("🧪 Bulk POS Sale Simulation Test")
-    st.info("Generate and process random test sales in bulk. Every sale updates the database like a real cashier transaction.")
+    st.title("🧪 Bulk POS Sale Simulation Test (REAL TABLES, SAFE LOGIC)")
+    st.info("Simulate many sales using the exact cashier logic: all stock, shortages, and sales tables are updated using the POS business logic. Test sales are tagged in the notes.")
 
     cat_df = get_item_catalogue()
     total_items = len(cat_df)
@@ -89,17 +49,28 @@ def display_bulk_test():
         with st.spinner("Running bulk test..."):
             for i in range(int(num_sales)):
                 cart = random_cart(cat_df, min_items, max_items, min_qty, max_qty)
-                sale_id, shortages = simulate_bulk_sale(cart, note, pay_method)
-                if sale_id:
-                    msg = f"✅ Sale #{sale_id} OK"
+                # Use the same method as your POS
+                saleid, shortages = cashier_handler.process_sale_with_shortage(
+                    cart_items=cart,
+                    discount_rate=0.0,        # set discount to 0 for simplicity
+                    payment_method=pay_method,
+                    cashier="BULKTEST",
+                    notes=f"[BULK TEST] {note}".strip()
+                )
+                if saleid:
+                    msg = f"✅ Sale #{saleid} OK"
                 else:
-                    msg = f"❌ Sale failed: {shortages}"
-                results.append({"sale": i + 1, "sale_id": sale_id, "result": msg, "shortages": shortages})
+                    msg = f"❌ Sale failed"
+                results.append({
+                    "sale": i + 1,
+                    "sale_id": saleid,
+                    "result": msg,
+                    "shortages": shortages
+                })
 
         st.success(f"Bulk test complete! {len(results)} sales processed.")
-        st.dataframe(pd.DataFrame(results))
-
-        # Optionally: show details of each sale, or log for audit
+        df = pd.DataFrame(results)
+        st.dataframe(df)
 
 if __name__ == "__main__":
     display_bulk_test()
