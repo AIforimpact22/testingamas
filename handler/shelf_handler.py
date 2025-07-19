@@ -2,8 +2,8 @@
 """
 ShelfHandler
 ============
-All DB helpers for the Selling Area (shelf) plus **auto‑refill helpers**
-that are called by the POS page after each sale.
+All DB helpers for the Selling Area (shelf) plus auto‑refill helpers that are
+called by the POS page after each sale.
 """
 
 from __future__ import annotations
@@ -210,11 +210,18 @@ class ShelfHandler(DatabaseManager):
     def resolve_shortages(
         self, *, itemid: int, qty_need: int, user: str
     ) -> int:
+        """
+        Consume open shortages for *itemid* (oldest first).
+        Returns any quantity still **uncovered** (≥ 0).
+
+        Fully fulfilled rows are **deleted** to avoid setting shortage_qty = 0
+        (which breaks the CHECK constraint).
+        """
         rows = self.fetch_data(
             """
             SELECT shortageid, shortage_qty
             FROM   shelf_shortage
-            WHERE  itemid = %s
+            WHERE  itemid   = %s
               AND  resolved = FALSE
             ORDER  BY logged_at;
             """,
@@ -225,24 +232,31 @@ class ShelfHandler(DatabaseManager):
         for r in rows.itertuples():
             if remaining == 0:
                 break
+
             take = min(remaining, int(r.shortage_qty))
 
-            self.execute_command(
-                """
-                UPDATE shelf_shortage
-                SET    shortage_qty = shortage_qty - %s,
-                       resolved_qty  = COALESCE(resolved_qty, 0) + %s,
-                       resolved      = (shortage_qty - %s = 0),
-                       resolved_at   = CASE WHEN shortage_qty - %s = 0
-                                            THEN CURRENT_TIMESTAMP END,
-                       resolved_by   = %s
-                WHERE  shortageid = %s;
-                """,
-                (take, take, take, take, user, r.shortageid),
-            )
+            if take == r.shortage_qty:
+                # fully satisfied → delete the row
+                self.execute_command(
+                    "DELETE FROM shelf_shortage WHERE shortageid = %s;",
+                    (r.shortageid,),
+                )
+            else:
+                # partially satisfied
+                self.execute_command(
+                    """
+                    UPDATE shelf_shortage
+                    SET    shortage_qty = shortage_qty - %s,
+                           resolved_qty  = COALESCE(resolved_qty, 0) + %s,
+                           resolved_by   = %s,
+                           resolved_at   = CURRENT_TIMESTAMP
+                    WHERE  shortageid = %s;
+                    """,
+                    (take, take, user, r.shortageid),
+                )
+
             remaining -= take
 
-        self.execute_command("DELETE FROM shelf_shortage WHERE shortage_qty = 0;")
         return remaining
 
     # ───────── auto‑refill helpers (called by POS) ─────────
