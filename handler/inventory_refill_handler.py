@@ -1,4 +1,13 @@
 # handler/inventory_refill_handler.py
+"""
+InventoryRefillHandler
+──────────────────────
+Automatically refills inventory for any SKU whose total on‑hand
+quantity drops below `threshold`, topping it up to `averagerequired`.
+
+Supplier is determined automatically from the itemsupplier table.
+"""
+
 from __future__ import annotations
 from datetime import date
 import pandas as pd
@@ -6,31 +15,33 @@ from psycopg2.extras import execute_values
 
 from db_handler import DatabaseManager
 
-DEFAULT_THRESHOLD = 50
-DEFAULT_AVERAGE   = 100
+DEFAULT_THRESHOLD = 50       # used when `threshold` is NULL
+DEFAULT_AVERAGE   = 100      # used when `averagerequired` is NULL
 
 
 class InventoryRefillHandler(DatabaseManager):
-    # ───────── inventory snapshot ─────────
+    # ───────────────────────── snapshot ─────────────────────────
     def _stock_levels(self) -> pd.DataFrame:
-        inv_totals = self.fetch_data(
+        inv = self.fetch_data(
             "SELECT itemid, SUM(quantity) AS totalqty "
             "FROM inventory GROUP BY itemid;"
         )
-        item_meta = self.fetch_data(
+
+        meta = self.fetch_data(
             f"""
             SELECT itemid,
                    itemnameenglish,
-                   COALESCE(shelfthreshold,{DEFAULT_THRESHOLD}) AS inventorythreshold,
-                   COALESCE(shelfaverage,  {DEFAULT_AVERAGE})   AS inventoryaverage
+                   COALESCE(threshold,       {DEFAULT_THRESHOLD}) AS inventorythreshold,
+                   COALESCE(averagerequired, {DEFAULT_AVERAGE})   AS inventoryaverage
             FROM   item;
             """
         )
-        df = item_meta.merge(inv_totals, on="itemid", how="left")
+
+        df = meta.merge(inv, on="itemid", how="left")
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ───────── supplier lookup ─────────
+    # ───────────────────── supplier lookup ─────────────────────
     def get_supplier_for_item(self, itemid: int) -> int | None:
         df = self.fetch_data(
             "SELECT supplierid FROM itemsupplier WHERE itemid = %s LIMIT 1",
@@ -38,18 +49,20 @@ class InventoryRefillHandler(DatabaseManager):
         )
         return None if df.empty else int(df.iloc[0, 0])
 
-    # ───────── low‑level helpers ─────────
+    # ───────────────────── PO & cost helpers ───────────────────
     def create_manual_po(self, supplier_id: int, note="AUTO REFILL") -> int:
-        return int(
-            self.execute_command_returning(
-                "INSERT INTO purchaseorders "
-                "(supplierid,status,orderdate,expecteddelivery,actualdelivery,"
-                " createdby,suppliernote,totalcost) "
-                "VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,CURRENT_DATE,"
-                " 'AutoInventory',%s,0) RETURNING poid;",
-                (supplier_id, note),
-            )[0]
-        )
+        poid = self.execute_command_returning(
+            """
+            INSERT INTO purchaseorders
+                  (supplierid,status,orderdate,expecteddelivery,actualdelivery,
+                   createdby,suppliernote,totalcost)
+            VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,CURRENT_DATE,
+                    'AutoInventory',%s,0.0)
+            RETURNING poid;
+            """,
+            (supplier_id, note),
+        )[0]
+        return int(poid)
 
     def add_po_item(self, poid, item_id, qty, cost):
         self.execute_command(
@@ -60,14 +73,13 @@ class InventoryRefillHandler(DatabaseManager):
         )
 
     def insert_poitem_cost(self, poid, item_id, cpu, qty, note) -> int:
-        return int(
-            self.execute_command_returning(
-                "INSERT INTO poitemcost "
-                "(poid,itemid,cost_per_unit,quantity,cost_date,note) "
-                "VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,%s) RETURNING costid",
-                (poid, item_id, cpu, qty, note),
-            )[0]
-        )
+        costid = self.execute_command_returning(
+            "INSERT INTO poitemcost "
+            "(poid,itemid,cost_per_unit,quantity,cost_date,note) "
+            "VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,%s) RETURNING costid",
+            (poid, item_id, cpu, qty, note),
+        )[0]
+        return int(costid)
 
     def add_inventory_rows(self, rows: list[dict]):
         tuples = [
@@ -93,7 +105,7 @@ class InventoryRefillHandler(DatabaseManager):
             (poid, poid),
         )
 
-    # ───────── PUBLIC: restock one item ─────────
+    # ───────────────────────── restock ─────────────────────────
     def restock_item(
         self,
         itemid: int,
@@ -103,9 +115,9 @@ class InventoryRefillHandler(DatabaseManager):
         note="AUTO REFILL",
     ) -> str:
         """
-        Refill *need* units of *itemid*.
+        Restock *need* units of *itemid*.
         • Supplier auto‑resolved via itemsupplier.
-        • Returns a short status string for UI ("OK PO#123", "NO SUPPLIER", etc.).
+        • Returns status string for UI.
         """
         if need <= 0:
             return "NOT NEEDED"
