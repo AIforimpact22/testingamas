@@ -2,34 +2,28 @@
 """
 InventoryRefillHandler
 ======================
-Automates warehouse‑level refills when inventory dips below thresholds.
+Automatically refills warehouse inventory when stock drops below each
+item’s `inventorythreshold`.
+
+Because `receive_handler.py` has been removed, this class now inherits
+directly from `db_handler.DatabaseManager` and re‑implements the minimal
+purchase‑order / inventory SQL helpers it needs.
 """
 
 from __future__ import annotations
 from datetime import date
-import importlib
 import pandas as pd
 
-# ── Robust import: supports either `receive_handler.py`
-#    at repo root *or* inside handler/ package.
-try:
-    ReceiveHandler = importlib.import_module(
-        "handler.receive_handler"
-    ).ReceiveHandler
-except ModuleNotFoundError:
-    ReceiveHandler = importlib.import_module("receive_handler").ReceiveHandler
+from db_handler import DatabaseManager
+from psycopg2.extras import execute_values
 
 DEFAULT_THRESHOLD = 50
 DEFAULT_AVERAGE   = 100
 
 
-class InventoryRefillHandler(ReceiveHandler):
+class InventoryRefillHandler(DatabaseManager):
     # ───────────────────── stock snapshot ─────────────────────
     def _stock_levels(self) -> pd.DataFrame:
-        """
-        Return current inventory totals merged with thresholds/averages.
-        Missing values default to 50 / 100.
-        """
         inv = self.fetch_data(
             """
             SELECT itemid, SUM(quantity) AS totalqty
@@ -52,6 +46,89 @@ class InventoryRefillHandler(ReceiveHandler):
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
+    # ───────────────────── supplier helper ─────────────────────
+    def get_suppliers(self) -> pd.DataFrame:
+        return self.fetch_data(
+            "SELECT supplierid, suppliername FROM supplier ORDER BY suppliername"
+        )
+
+    # ───────────────────── PO / inventory helpers ─────────────────────
+    def create_manual_po(self, supplier_id: int, note: str = "") -> int:
+        poid = self.execute_command_returning(
+            """
+            INSERT INTO purchaseorders
+                  (supplierid, status, orderdate, expecteddelivery,
+                   actualdelivery, createdby, suppliernote, totalcost)
+            VALUES (%s, 'Completed', CURRENT_DATE, CURRENT_DATE,
+                    CURRENT_DATE, 'AutoInventory', %s, 0.0)
+            RETURNING poid
+            """,
+            (supplier_id, note),
+        )[0]
+        return int(poid)
+
+    def add_po_item(self, poid: int, item_id: int, qty: int, cost: float):
+        self.execute_command(
+            """
+            INSERT INTO purchaseorderitems
+                  (poid, itemid, orderedquantity, receivedquantity, estimatedprice)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (poid, item_id, qty, qty, cost),
+        )
+
+    def insert_poitem_cost(
+        self, poid: int, item_id: int, cost_per_unit: float, qty: int, note: str
+    ) -> int:
+        costid = self.execute_command_returning(
+            """
+            INSERT INTO poitemcost (poid, itemid, cost_per_unit,
+                                    quantity, cost_date, note)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, %s)
+            RETURNING costid
+            """,
+            (poid, item_id, cost_per_unit, qty, note),
+        )[0]
+        return int(costid)
+
+    def add_items_to_inventory(self, rows: list[dict]) -> None:
+        tuples = [
+            (
+                int(r["item_id"]),
+                int(r["quantity"]),
+                r["expiration_date"],
+                r["storage_location"],
+                float(r["cost_per_unit"]),
+                r["poid"],
+                r["costid"],
+            )
+            for r in rows
+        ]
+        sql = """
+            INSERT INTO inventory
+                  (itemid, quantity, expirationdate,
+                   storagelocation, cost_per_unit, poid, costid)
+            VALUES %s
+        """
+        self._ensure_live_conn()
+        with self.conn:
+            with self.conn.cursor() as cur:
+                execute_values(cur, sql, tuples)
+
+    def refresh_po_total_cost(self, poid: int):
+        self.execute_command(
+            """
+            UPDATE purchaseorders
+            SET    totalcost = COALESCE((
+                    SELECT SUM(quantity * cost_per_unit)
+                    FROM   poitemcost
+                    WHERE  poid = %s
+                  ),0)
+            WHERE  poid = %s
+            """,
+            (poid, poid),
+        )
+
     # ─────────────────── single‑item restock ───────────────────
     def restock_item(
         self,
@@ -62,7 +139,7 @@ class InventoryRefillHandler(ReceiveHandler):
         cost_per_unit: float = 0.0,
         note: str = "Auto‑Inventory Refill",
     ) -> int:
-        """Create synthetic PO, insert inventory layer, return new POID."""
+        """Create synthetic PO, insert inventory layer; return POID."""
         if need <= 0:
             return -1
 
@@ -92,10 +169,6 @@ class InventoryRefillHandler(ReceiveHandler):
         *,
         dry_run: bool = False,
     ) -> pd.DataFrame:
-        """
-        Refill every SKU below threshold.  Returns summary DataFrame.
-        If *dry_run* is True, no DB writes are made.
-        """
         df    = self._stock_levels()
         needs = df[df.totalqty < df.inventorythreshold].copy()
 
