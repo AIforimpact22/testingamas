@@ -1,3 +1,8 @@
+import streamlit as st
+if not st.session_state.get("sim_active", True):
+    st.stop()          # abort the page run immediately
+
+
 # pages/shelf_auto_refill.py
 """
 Shelf Refill Monitor (auto‑refresh)
