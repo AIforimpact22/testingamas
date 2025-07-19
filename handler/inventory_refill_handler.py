@@ -1,30 +1,36 @@
 # handler/inventory_refill_handler.py
 """
 InventoryRefillHandler
-======================
-Automatically refills warehouse inventory when stock drops below each
-item’s `inventorythreshold`.
+──────────────────────
+Refills warehouse inventory when total stock for an item falls below
+its `shelfthreshold` (fallback = 50).  It tops the item back up to
+`shelfaverage` (fallback = 100) by creating a synthetic **Completed**
+purchase‑order and inserting a new inventory layer.
 
-Because `receive_handler.py` has been removed, this class now inherits
-directly from `db_handler.DatabaseManager` and re‑implements the minimal
-purchase‑order / inventory SQL helpers it needs.
+This handler depends only on `db_handler.DatabaseManager`; no other
+handlers are required.
 """
 
 from __future__ import annotations
 from datetime import date
-import pandas as pd
 
-from db_handler import DatabaseManager
+import pandas as pd
 from psycopg2.extras import execute_values
 
-DEFAULT_THRESHOLD = 50
-DEFAULT_AVERAGE   = 100
+from db_handler import DatabaseManager
+
+DEFAULT_THRESHOLD = 50   # used when shelfthreshold is NULL / missing
+DEFAULT_AVERAGE   = 100  # used when shelfaverage   is NULL / missing
 
 
 class InventoryRefillHandler(DatabaseManager):
-    # ───────────────────── stock snapshot ─────────────────────
+    # ───────────────────── inventory snapshot ─────────────────────
     def _stock_levels(self) -> pd.DataFrame:
-        inv = self.fetch_data(
+        """
+        Merge current inventory totals with per‑item thresholds & targets.
+        Falls back to DEFAULT_THRESHOLD / DEFAULT_AVERAGE when necessary.
+        """
+        inv_totals = self.fetch_data(
             """
             SELECT itemid, SUM(quantity) AS totalqty
             FROM   inventory
@@ -32,17 +38,17 @@ class InventoryRefillHandler(DatabaseManager):
             """
         )
 
-        meta = self.fetch_data(
+        item_meta = self.fetch_data(
             f"""
             SELECT itemid,
                    itemnameenglish,
-                   COALESCE(inventorythreshold,{DEFAULT_THRESHOLD}) AS inventorythreshold,
-                   COALESCE(inventoryaverage,  {DEFAULT_AVERAGE})   AS inventoryaverage
+                   COALESCE(shelfthreshold, {DEFAULT_THRESHOLD}) AS inventorythreshold,
+                   COALESCE(shelfaverage,   {DEFAULT_AVERAGE})   AS inventoryaverage
             FROM   item;
             """
         )
 
-        df = meta.merge(inv, on="itemid", how="left")
+        df = item_meta.merge(inv_totals, on="itemid", how="left")
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
@@ -52,7 +58,7 @@ class InventoryRefillHandler(DatabaseManager):
             "SELECT supplierid, suppliername FROM supplier ORDER BY suppliername"
         )
 
-    # ───────────────────── PO / inventory helpers ─────────────────────
+    # ───────────────────── PO / inventory primitives ─────────────────────
     def create_manual_po(self, supplier_id: int, note: str = "") -> int:
         poid = self.execute_command_returning(
             """
@@ -61,7 +67,7 @@ class InventoryRefillHandler(DatabaseManager):
                    actualdelivery, createdby, suppliernote, totalcost)
             VALUES (%s, 'Completed', CURRENT_DATE, CURRENT_DATE,
                     CURRENT_DATE, 'AutoInventory', %s, 0.0)
-            RETURNING poid
+            RETURNING poid;
             """,
             (supplier_id, note),
         )[0]
@@ -72,7 +78,7 @@ class InventoryRefillHandler(DatabaseManager):
             """
             INSERT INTO purchaseorderitems
                   (poid, itemid, orderedquantity, receivedquantity, estimatedprice)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s);
             """,
             (poid, item_id, qty, qty, cost),
         )
@@ -85,7 +91,7 @@ class InventoryRefillHandler(DatabaseManager):
             INSERT INTO poitemcost (poid, itemid, cost_per_unit,
                                     quantity, cost_date, note)
             VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, %s)
-            RETURNING costid
+            RETURNING costid;
             """,
             (poid, item_id, cost_per_unit, qty, note),
         )[0]
@@ -104,14 +110,15 @@ class InventoryRefillHandler(DatabaseManager):
             )
             for r in rows
         ]
+
         sql = """
             INSERT INTO inventory
                   (itemid, quantity, expirationdate,
                    storagelocation, cost_per_unit, poid, costid)
-            VALUES %s
+            VALUES %s;
         """
         self._ensure_live_conn()
-        with self.conn:
+        with self.conn:  # one BEGIN/COMMIT block
             with self.conn.cursor() as cur:
                 execute_values(cur, sql, tuples)
 
@@ -119,12 +126,11 @@ class InventoryRefillHandler(DatabaseManager):
         self.execute_command(
             """
             UPDATE purchaseorders
-            SET    totalcost = COALESCE((
-                    SELECT SUM(quantity * cost_per_unit)
-                    FROM   poitemcost
-                    WHERE  poid = %s
-                  ),0)
-            WHERE  poid = %s
+            SET    totalcost = COALESCE(
+                     (SELECT SUM(quantity * cost_per_unit)
+                      FROM   poitemcost
+                      WHERE  poid = %s), 0)
+            WHERE  poid = %s;
             """,
             (poid, poid),
         )
@@ -139,7 +145,10 @@ class InventoryRefillHandler(DatabaseManager):
         cost_per_unit: float = 0.0,
         note: str = "Auto‑Inventory Refill",
     ) -> int:
-        """Create synthetic PO, insert inventory layer; return POID."""
+        """
+        Create synthetic PO and insert a new inventory layer for *need* units.
+        Returns the generated POID (or −1 if need ≤ 0).
+        """
         if need <= 0:
             return -1
 
@@ -161,32 +170,3 @@ class InventoryRefillHandler(DatabaseManager):
 
         self.refresh_po_total_cost(poid)
         return poid
-
-    # ─────────────────── bulk check & refill ───────────────────
-    def check_and_restock_all(
-        self,
-        supplier_id: int,
-        *,
-        dry_run: bool = False,
-    ) -> pd.DataFrame:
-        df    = self._stock_levels()
-        needs = df[df.totalqty < df.inventorythreshold].copy()
-
-        actions = []
-        for _, row in needs.iterrows():
-            need_units = int(row.inventoryaverage) - int(row.totalqty)
-            poid = None
-            if not dry_run:
-                poid = self.restock_item(
-                    int(row.itemid), supplier_id, need_units
-                )
-            actions.append({
-                "itemid"      : int(row.itemid),
-                "itemname"    : row.itemnameenglish,
-                "current_qty" : int(row.totalqty),
-                "threshold"   : int(row.inventorythreshold),
-                "target"      : int(row.inventoryaverage),
-                "added"       : need_units,
-                "poid"        : poid,
-            })
-        return pd.DataFrame(actions)
