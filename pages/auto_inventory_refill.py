@@ -1,18 +1,13 @@
-import streamlit as st
-if not st.session_state.get("sim_active", True):
-    st.stop()          # abort the page run immediately
-
-
-# pages/auto_inventory_refill.py
+from __future__ import annotations
 """
 Auto‑Inventory Refill Monitor
 ─────────────────────────────
-• Every 15 s it checks inventory.
-• If total stock < `threshold`, it creates a synthetic PO (supplier from
-  itemsupplier) and tops the item up to `averagerequired`.
+• Checks inventory every 15 s.
+• If total stock < `threshold`, it creates a synthetic PO (supplier is taken
+  automatically from the itemsupplier table) and tops the item up to
+  `averagerequired`.
 """
 
-from __future__ import annotations
 import time
 import streamlit as st
 import pandas as pd
@@ -20,7 +15,7 @@ from handler.inventory_refill_handler import InventoryRefillHandler
 
 irh = InventoryRefillHandler()
 
-# ───────── snapshot helper ─────────
+# ───────── helpers ─────────
 @st.cache_data(ttl=5, show_spinner=False)
 def snapshot() -> pd.DataFrame:
     return irh._stock_levels()
@@ -39,7 +34,12 @@ def restock(df_need: pd.DataFrame) -> pd.DataFrame:
 now = time.time()
 if "last_refill" not in st.session_state:
     st.session_state["last_refill"] = 0.0
-allow_refill = now - st.session_state["last_refill"] > 10
+allow_refill = now - st.session_state["last_refill"] > 10  # seconds
+
+# ───────── simulation master switch ─────────
+if not st.session_state.get("sim_active", True):
+    st.warning("Simulators are paused (toggle in main sidebar).")
+    st.stop()
 
 # ───────── UI ─────────
 st.set_page_config("Auto‑Inventory Refill", "📦")
