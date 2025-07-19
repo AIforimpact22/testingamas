@@ -8,7 +8,7 @@ from handler.inventory_refill_handler import InventoryRefillHandler
 
 irh = InventoryRefillHandler()
 
-# ───────────────────────── helpers ─────────────────────────
+# ───────── cached snapshot ─────────
 @st.cache_data(ttl=5, show_spinner=False)
 def snapshot() -> pd.DataFrame:
     return irh._stock_levels()
@@ -21,7 +21,7 @@ def restock(df_need: pd.DataFrame, supplier_id: int) -> pd.DataFrame:
         acts.append({"item": row.itemnameenglish, "added": need, "poid": poid})
     return pd.DataFrame(acts)
 
-# ───────────────────────── UI / loop ───────────────────────
+# ───────── UI ─────────
 st.set_page_config(page_title="Auto‑Inventory Refill", page_icon="📦")
 st.title("📦 Auto‑Inventory Refill Monitor")
 
@@ -35,11 +35,11 @@ supplier_name = st.selectbox("Supplier for auto‑refills",
                              list(supplier_map.keys()), index=0)
 supplier_id = supplier_map[supplier_name]
 
-# Throttle – run refills at most once every 10 s
+# run throttling
 NOW = time.time()
 if "last_refill_ts" not in st.session_state:
     st.session_state["last_refill_ts"] = 0.0
-ALLOW_REFILL = NOW - st.session_state["last_refill_ts"] > 10
+ALLOW_REFILL = NOW - st.session_state["last_refill_ts"] > 10  # seconds
 
 df = snapshot()
 below = df[df.totalqty < df.inventorythreshold]
@@ -48,9 +48,7 @@ col1, col2 = st.columns(2)
 col1.metric("Total SKUs", len(df))
 col2.metric("Below threshold", len(below))
 
-if below.empty:
-    st.info("All items meet threshold.")
-else:
+if not below.empty:
     st.dataframe(
         below[["itemnameenglish", "totalqty",
                "inventorythreshold", "inventoryaverage"]],
@@ -58,16 +56,16 @@ else:
     )
 
     if ALLOW_REFILL:
-        with st.spinner("Restocking..."):
+        with st.spinner("Restocking…"):
             acts = restock(below, supplier_id)
         st.session_state["last_refill_ts"] = NOW
         st.success(f"{len(acts)} item(s) restocked.")
         st.dataframe(acts, use_container_width=True)
-        # show updated snapshot without waiting for next autorefresh
-        df = snapshot()
+        df = snapshot()       # fresh post‑refill view
         below = df[df.totalqty < df.inventorythreshold]
+else:
+    st.info("All items meet threshold.")
 
-# fresh snapshot display
 st.subheader("Current inventory snapshot")
 st.dataframe(
     df[["itemnameenglish", "totalqty",
@@ -76,6 +74,6 @@ st.dataframe(
     use_container_width=True,
 )
 
-# gentle auto‑refresh every 15 s
+# polite auto‑refresh every 15 s
 if hasattr(st, "autorefresh"):
     st.autorefresh(interval=15000, key="inv_refresh")
