@@ -4,8 +4,8 @@ Shelf Auto‑Refill Simulator
 ──────────────────────────
 • Generates random POS sales (unique items, random qty)
 • Executes each sale via CashierHandler.process_sale_with_shortage
-• Immediately tops‑up shelf stock from back‑store inventory
-  until it reaches `threshold` / `averagerequired` levels.
+• Immediately refills shelf stock from inventory up to each item’s
+  threshold / average levels.
 """
 
 import streamlit as st
@@ -13,10 +13,10 @@ import pandas as pd
 import random
 from datetime import datetime
 
-from cashier_handler import CashierHandler
-from shelf_handler   import ShelfHandler
+from handler.cashier_handler import CashierHandler
+from handler.shelf_handler   import ShelfHandler
 
-# ────────────────── stop if simulators are paused ──────────────────
+# ───────── abort if simulators are paused ─────────
 if not st.session_state.get("sim_active", True):
     st.warning("Simulators are paused (toggle in main sidebar).")
     st.stop()
@@ -89,7 +89,7 @@ def restock_item(itemid: int, *, user="AUTOSIM") -> None:
     if need <= 0:
         return
 
-    # 1) resolve open shortages
+    # 1) resolve open shortages first
     need = shelf.resolve_shortages(itemid=itemid, qty_need=need, user=user)
     if need <= 0:
         return
@@ -187,5 +187,7 @@ if st.button("Run simulation"):
             pay_method, user_tag,
         )
     if not df.empty:
-        st.success(f"Finished.  **{(df.status == 'OK').sum()} / {len(df)}** sales succeeded.")
+        st.success(
+            f"Finished.  **{(df.status == 'OK').sum()} / {len(df)}** sales succeeded."
+        )
         st.dataframe(df)
