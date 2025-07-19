@@ -1,3 +1,7 @@
+import streamlit as st
+if not st.session_state.get("sim_active", True):
+    st.stop()          # abort the page run immediately
+
 # pages/auto_POS.py
 """
 Bulk POS Sale Simulation
