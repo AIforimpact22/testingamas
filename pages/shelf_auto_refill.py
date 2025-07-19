@@ -1,199 +1,76 @@
 # pages/shelf_auto_refill.py
 """
-Shelf Auto‑Refill Simulator
-──────────────────────────
-• Generates random POS sales (unique items, random quantities)
-• Executes each sale via CashierHandler.process_sale_with_shortage
-• Immediately tops‑up shelf stock from back‑store inventory
-  until it reaches item.shelfaverage (or at least shelfthreshold)
+Shelf Refill Monitor (auto‑refresh)
+-----------------------------------
+Displays live shelf KPIs and open shortages.
+Refill work itself happens inside handler.shelf_handler.post_sale_restock().
 """
 
 from __future__ import annotations
 
-import random
-from datetime import datetime
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
 
-# UPDATED IMPORT PATHS ────────────────────────────────────────────
-from handler.cashier_handler import CashierHandler
 from handler.shelf_handler import ShelfHandler
 
-# ───────────────────────── connections ────────────────────────────
-cashier = CashierHandler()
-shelf   = ShelfHandler()
+shelf = ShelfHandler()
 
-# ───────────────────────── cached master data ─────────────────────
-@st.cache_data(ttl=600, show_spinner=False)
-def get_item_meta() -> pd.DataFrame:
-    """Fetch item‑level shelf targets once per 10 min."""
-    return shelf.get_all_items().set_index("itemid")   # has shelfthreshold / average
+# ───────────────────────── helpers ─────────────────────────
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_kpis() -> pd.DataFrame:
+    return shelf.get_shelf_quantity_by_item()
 
-ITEM_META = get_item_meta()
-
-# ───────────────────────── cart generator ─────────────────────────
-def random_cart(cat_df: pd.DataFrame,
-                min_items: int, max_items: int,
-                min_qty:   int, max_qty:   int) -> list[dict]:
-    n_items = random.randint(min_items, min(max_items, len(cat_df)))
-    picks   = cat_df.sample(n=n_items, replace=False)
-    return [
-        {
-            "itemid"      : int(r.itemid),
-            "quantity"    : random.randint(min_qty, max_qty),
-            "sellingprice": float(r.sellingprice),
-        }
-        for _, r in picks.iterrows()
-    ]
-
-# ───────────────────────── inventory helpers ──────────────────────
-def _inventory_layers(itemid: int) -> pd.DataFrame:
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_open_shortages() -> pd.DataFrame:
     return shelf.fetch_data(
         """
-        SELECT expirationdate, quantity, cost_per_unit
-        FROM   inventory
-        WHERE  itemid = %s AND quantity > 0
-        ORDER  BY expirationdate, cost_per_unit;
-        """,
-        (itemid,),
-    )
-
-def _choose_layers(itemid: int, need: int) -> list[dict]:
-    plan, remain = [], need
-    for r in _inventory_layers(itemid).itertuples():
-        take = min(remain, int(r.quantity))
-        plan.append({
-            "expirationdate": r.expirationdate,
-            "qty"           : take,
-            "cost"          : float(r.cost_per_unit),
-        })
-        remain -= take
-        if remain == 0:
-            break
-    return plan
-
-# ───────────────────────── refill logic ───────────────────────────
-def restock_item(itemid: int, *, user="AUTOSIM") -> None:
-    """Top up shelf stock for *itemid* to its configured average/threshold."""
-    kpis = shelf.get_shelf_quantity_by_item()
-    row  = kpis.loc[kpis.itemid == itemid]
-
-    current   = int(row.totalquantity.iloc[0]) if not row.empty else 0
-    threshold = int(ITEM_META.at[itemid, "shelfthreshold"] or 0)
-    target    = int(ITEM_META.at[itemid, "shelfaverage"]   or threshold or 0)
-
-    # Already healthy?
-    if current >= threshold:
-        return
-
-    need = max(target - current, threshold - current)
-    if need <= 0:
-        return
-
-    # 1️⃣  resolve open shortages first
-    need = shelf.resolve_shortages(itemid=itemid, qty_need=need, user=user)
-    if need <= 0:
-        return
-
-    # 2️⃣  pull layers from inventory → shelf
-    for layer in _choose_layers(itemid, need):
-        shelf.transfer_from_inventory(
-            itemid        = itemid,
-            expirationdate= layer["expirationdate"],
-            quantity      = layer["qty"],
-            cost_per_unit = layer["cost"],
-            created_by    = user,
-        )
-        need -= layer["qty"]
-        if need <= 0:
-            break
-
-    # 3️⃣  still short? → log shortage ticket
-    if need > 0:
-        shelf.execute_command(
-            """
-            INSERT INTO shelf_shortage (itemid, shortage_qty, logged_at)
-            VALUES (%s, %s, CURRENT_TIMESTAMP);
-            """,
-            (itemid, need),
-        )
-
-def post_sale_restock(cart: list[dict], *, user="AUTOSIM") -> None:
-    for entry in cart:
-        restock_item(int(entry["itemid"]), user=user)
-
-# ───────────────────────── simulation core ────────────────────────
-def simulate_sales(num_sales: int,
-                   min_items: int, max_items: int,
-                   min_qty : int,  max_qty : int,
-                   pay_method: str, user_tag: str) -> pd.DataFrame:
-
-    cat_df = cashier.fetch_data(
-        """
-        SELECT itemid, sellingprice
-        FROM   item
-        WHERE  sellingprice IS NOT NULL AND sellingprice > 0;
+        SELECT i.itemnameenglish AS itemname,
+               ss.shortage_qty,
+               ss.logged_at
+        FROM   shelf_shortage ss
+        JOIN   item i ON i.itemid = ss.itemid
+        WHERE  ss.resolved = FALSE
+        ORDER  BY ss.logged_at;
         """
     )
-    if cat_df.empty:
-        st.error("Catalogue empty – cannot simulate.")
-        return pd.DataFrame()
 
-    results = []
-    for n in range(num_sales):
-        cart = random_cart(cat_df, min_items, max_items, min_qty, max_qty)
-        try:
-            saleid, shortages = cashier.process_sale_with_shortage(
-                cart_items     = cart,
-                discount_rate  = 0.0,
-                payment_method = pay_method,
-                cashier        = user_tag,
-                notes          = f"[AUTO SIM {datetime.utcnow():%Y-%m-%d}]",
-            )
-            status = "OK" if saleid else "FAIL"
-        except Exception as e:
-            cashier.conn.rollback()
-            saleid, shortages, status = None, [], f"ERROR: {e}"
+# ───────────────────────── UI ──────────────────────────────
+st.set_page_config(page_title="Shelf Refill Monitor", page_icon="📈", layout="wide")
+st.title("📈 Shelf Refill Monitor")
 
-        # Refill shelf after each successful sale
-        if saleid:
-            post_sale_restock(cart, user=user_tag)
+# auto‑refresh every 5 s (Streamlit ≥ 1.33)
+if hasattr(st, "autorefresh"):
+    st.autorefresh(interval=5000, key="refill_monitor")
 
-        results.append({
-            "sale_no" : n + 1,
-            "sale_id" : saleid,
-            "items"   : len(cart),
-            "status"  : status,
-            "shortages": shortages,
-        })
+kpis = fetch_kpis()
+if kpis.empty:
+    st.info("Shelf table empty.")
+    st.stop()
 
-    return pd.DataFrame(results)
+kpis["below_threshold"] = kpis["totalquantity"] < kpis["shelfthreshold"].fillna(0)
 
-# ───────────────────────── Streamlit UI ───────────────────────────
-st.set_page_config(page_title="Shelf Auto‑Refill Simulator", page_icon="🛒")
+low_df       = kpis[kpis["below_threshold"]]
+shortages_df = fetch_open_shortages()
 
-st.title("🛒 Shelf Auto‑Refill Simulator")
+col1, col2 = st.columns(2)
+col1.metric("Total SKUs on shelf", len(kpis))
+col1.metric("Below threshold", len(low_df))
+col2.metric("Open shortage tickets", len(shortages_df))
 
-with st.sidebar:
-    st.header("Simulation parameters")
-    num_sales  = st.number_input("Sales to simulate", 1, 500, 50, 1)
-    min_items  = st.number_input("Min items / sale", 1, 20, 2)
-    max_items  = st.number_input("Max items / sale", min_items, 30, 6)
-    min_qty    = st.number_input("Min qty / item",   1, 20, 1)
-    max_qty    = st.number_input("Max qty / item",   min_qty, 50, 5)
-    pay_method = st.selectbox("Payment method", ["Cash", "Card"])
-    user_tag   = st.text_input("Cashier tag", "AUTOSIM")
+st.subheader("Shelf stock vs. thresholds")
+st.dataframe(
+    kpis[["itemname", "totalquantity", "shelfthreshold", "shelfaverage"]]
+        .sort_values("itemname"),
+    use_container_width=True
+)
 
-if st.button("Run simulation"):
-    with st.spinner("Simulating…"):
-        df = simulate_sales(
-            num_sales,
-            min_items, max_items,
-            min_qty,   max_qty,
-            pay_method, user_tag,
-        )
-    if not df.empty:
-        ok = (df.status == "OK").sum()
-        st.success(f"Finished: **{ok} / {len(df)}** sales succeeded.")
-        st.dataframe(df)
+if not low_df.empty:
+    st.subheader("⚠️ Items needing attention")
+    st.dataframe(
+        low_df[["itemname", "totalquantity", "shelfthreshold", "shelfaverage"]],
+        use_container_width=True
+    )
+
+if not shortages_df.empty:
+    st.subheader("🚨 Open shortages")
+    st.dataframe(shortages_df, use_container_width=True)
