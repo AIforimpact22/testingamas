@@ -11,7 +11,7 @@ DEFAULT_AVERAGE   = 100
 
 
 class InventoryRefillHandler(DatabaseManager):
-    # ───────── snapshot (inv + thresholds) ─────────
+    # ───────── snapshot ─────────
     def _stock_levels(self) -> pd.DataFrame:
         inv = self.fetch_data(
             """
@@ -33,13 +33,19 @@ class InventoryRefillHandler(DatabaseManager):
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ───────── suppliers helper ─────────
-    def get_suppliers(self) -> pd.DataFrame:
-        return self.fetch_data(
-            "SELECT supplierid, suppliername FROM supplier ORDER BY suppliername"
+    # ───────── supplier helpers ─────────
+    def get_supplier_for_item(self, itemid: int) -> int | None:
+        """
+        Return the *first* supplierid linked to this item in itemsupplier.
+        (If you have a primary flag/priority column, adapt accordingly.)
+        """
+        df = self.fetch_data(
+            "SELECT supplierid FROM itemsupplier WHERE itemid = %s LIMIT 1",
+            (itemid,),
         )
+        return None if df.empty else int(df.iloc[0, 0])
 
-    # ───────── PO & inventory primitives ─────────
+    # ───────── PO / inventory primitives (unchanged) ─────────
     def create_manual_po(self, supplier_id: int, note="AUTO REFILL") -> int:
         return int(
             self.execute_command_returning(
@@ -48,39 +54,31 @@ class InventoryRefillHandler(DatabaseManager):
                       (supplierid, status, orderdate, expecteddelivery,
                        actualdelivery, createdby, suppliernote, totalcost)
                 VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,
-                        CURRENT_DATE,'AutoInventory',%s,0)
-                RETURNING poid;
-                """,
+                        CURRENT_DATE,'AutoInventory',%s,0.0)
+                RETURNING poid;""",
                 (supplier_id, note),
             )[0]
         )
 
-    def add_po_item(self, poid: int, item_id: int, qty: int, cost: float):
+    def add_po_item(self, poid, item_id, qty, cost):  # cost can be 0 for sim
         self.execute_command(
-            """
-            INSERT INTO purchaseorderitems
-                  (poid,itemid,orderedquantity,receivedquantity,estimatedprice)
-            VALUES (%s,%s,%s,%s,%s);
-            """,
+            "INSERT INTO purchaseorderitems "
+            "(poid,itemid,orderedquantity,receivedquantity,estimatedprice) "
+            "VALUES (%s,%s,%s,%s,%s)",
             (poid, item_id, qty, qty, cost),
         )
 
-    def insert_poitem_cost(
-        self, poid: int, item_id: int, cpu: float, qty: int, note: str
-    ) -> int:
+    def insert_poitem_cost(self, poid, item_id, cpu, qty, note) -> int:
         return int(
             self.execute_command_returning(
-                """
-                INSERT INTO poitemcost (poid,itemid,cost_per_unit,
-                                        quantity,cost_date,note)
-                VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,%s)
-                RETURNING costid;
-                """,
+                "INSERT INTO poitemcost "
+                "(poid,itemid,cost_per_unit,quantity,cost_date,note) "
+                "VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,%s) RETURNING costid",
                 (poid, item_id, cpu, qty, note),
             )[0]
         )
 
-    def add_inventory_rows(self, rows: list[dict]) -> None:
+    def add_inventory_rows(self, rows: list[dict]):
         tuples = [
             (
                 r["item_id"],
@@ -93,42 +91,45 @@ class InventoryRefillHandler(DatabaseManager):
             )
             for r in rows
         ]
-        sql = """
-            INSERT INTO inventory
-                  (itemid,quantity,expirationdate,
-                   storagelocation,cost_per_unit,poid,costid)
-            VALUES %s;
-        """
+        sql = ("INSERT INTO inventory "
+               "(itemid,quantity,expirationdate,"
+               " storagelocation,cost_per_unit,poid,costid) "
+               "VALUES %s")
         self._ensure_live_conn()
-        cur = self.conn.cursor()
-        execute_values(cur, sql, tuples)
+        with self.conn.cursor() as cur:
+            execute_values(cur, sql, tuples)
         self.conn.commit()
-        cur.close()
 
     def refresh_po_total_cost(self, poid: int):
         self.execute_command(
-            """
-            UPDATE purchaseorders
-            SET    totalcost = COALESCE((
-                     SELECT SUM(quantity*cost_per_unit)
-                     FROM   poitemcost WHERE poid=%s),0)
-            WHERE  poid=%s;
-            """,
+            "UPDATE purchaseorders SET totalcost = COALESCE(("
+            "SELECT SUM(quantity*cost_per_unit) FROM poitemcost WHERE poid=%s"
+            "),0) WHERE poid=%s",
             (poid, poid),
         )
 
-    # ───────── refill one SKU ─────────
+    # ───────── restock single item ─────────
     def restock_item(
         self,
         itemid: int,
-        supplier_id: int,
         need: int,
         *,
         cpu: float = 0.0,
         note="AUTO REFILL",
-    ) -> int:
+    ) -> int | None:
+        """
+        Restock *itemid* by *need* units.
+        Looks up the supplier automatically via itemsupplier.
+        Returns the new POID, or None if no supplier mapping found.
+        """
         if need <= 0:
-            return -1
+            return None
+
+        supplier_id = self.get_supplier_for_item(itemid)
+        if supplier_id is None:
+            # no supplier mapping – skip with warning
+            return None
+
         poid = self.create_manual_po(supplier_id, note)
         self.add_po_item(poid, itemid, need, cpu)
         costid = self.insert_poitem_cost(poid, itemid, cpu, need, note)
