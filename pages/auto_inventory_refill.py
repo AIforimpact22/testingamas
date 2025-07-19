@@ -1,147 +1,138 @@
 # pages/auto_inventory_refill.py
 """
-Auto‑Inventory Refill Simulator
-───────────────────────────────
-• Polls the back‑store inventory every N seconds
-• When total quantity for an item falls below its **re‑order point**
-  (here: `max(2 × shelfaverage, 3 × shelfthreshold)` or default 50),
-  it creates a *synthetic* Purchase Order, books a matching receipt,
-  and inserts the goods into the `inventory` table.
-• Uses ReceiveHandler + ShelfHandler helpers – **no buttons**;
-  the page just refreshes and logs what it did.
+Auto‑Inventory Refill Monitor
+─────────────────────────────
+• Polls current inventory every 5 seconds.
+• When an item’s total quantity drops below its `inventorythreshold`
+  (column in `item` table; fallback = 50), it creates a synthetic PO and
+  inserts stock to bring the count back up to `inventoryaverage`
+  (fallback = inventorythreshold × 2).
 """
 
 from __future__ import annotations
-import random
-from datetime import date, timedelta
-
-import pandas as pd
+from datetime import date
 import streamlit as st
+import pandas as pd
 
-from handler.shelf_handler     import ShelfHandler
-from handler.receive_handler   import ReceiveHandler
+from handler.receive_handler import ReceiveHandler
 
-shelf   = ShelfHandler()
-recv    = ReceiveHandler()
-
-# ⏱️  ——————————————————————— page config & auto‑refresh
-st.set_page_config(page_title="Inventory Auto‑Refill", page_icon="🚚",
-                   layout="wide")
-st.title("🚚 Inventory Auto‑Refill Monitor")
-
-if hasattr(st, "autorefresh"):          # Streamlit ≥ 1.33
-    st.autorefresh(interval=5000, key="inv_autorefresh")   # every 5 s
+rh = ReceiveHandler()
 
 # ───────────────────────── helpers ─────────────────────────
 @st.cache_data(ttl=5, show_spinner=False)
-def current_inventory() -> pd.DataFrame:
-    """Item‑level totals in back‑store inventory."""
-    return shelf.fetch_data(
+def get_stock_levels() -> pd.DataFrame:
+    """
+    Return current inventory totals merged with item‑level thresholds.
+    Expects optional columns `inventorythreshold` & `inventoryaverage`
+    in the `item` table. Falls back to 50 / 100 if NULL / missing.
+    """
+    inv = rh.fetch_data(
         """
-        SELECT  i.itemid,
-                i.itemnameenglish AS itemname,
-                COALESCE(SUM(inv.quantity), 0) AS qty
-        FROM    item i
-        LEFT JOIN inventory inv ON inv.itemid = i.itemid
-        GROUP   BY i.itemid, i.itemnameenglish
+        SELECT itemid, SUM(quantity) AS totalqty
+        FROM   inventory
+        GROUP  BY itemid;
         """
     )
 
-@st.cache_data(ttl=600, show_spinner=False)
-def item_targets() -> pd.DataFrame:
-    """Bring shelfaverage / shelfthreshold for each item once / 10 min."""
-    return shelf.get_all_items().set_index("itemid")        # threshold & average
+    meta = rh.fetch_data(
+        """
+        SELECT itemid,
+               itemnameenglish,
+               COALESCE(inventorythreshold, 50) AS inventorythreshold,
+               COALESCE(inventoryaverage, 100)  AS inventoryaverage
+        FROM   item;
+        """
+    )
 
-def choose_supplier_id() -> int:
-    """Pick the first supplier as the ‘auto’ supplier, else raise."""
-    df = recv.get_suppliers()
-    if df.empty:
-        raise RuntimeError("No supplier records available – add at least one!")
-    return int(df.iloc[0].supplierid)
+    df = meta.merge(inv, on="itemid", how="left")
+    df["totalqty"] = df["totalqty"].fillna(0).astype(int)
+    return df
 
-def synthetic_cost(itemid: int) -> float:
-    """Crude cost estimator: random 1.0–5.0 currency units."""
-    random.seed(itemid)              # deterministic per SKU
-    return round(random.uniform(1.00, 5.00), 2)
 
-# ───────────────────────── refill engine ───────────────────
-def auto_replenish() -> list[str]:
+def restock_item(row: pd.Series, supplier_id: int) -> None:
     """
-    Check every item and top‑up inventory if below its reorder point.
-    Returns log lines describing what was done this cycle.
+    Bring `row.itemid` up to `inventoryaverage`. Uses ReceiveHandler
+    helpers to create a synthetic PO and insert inventory.
     """
-    inv_df  = current_inventory()
-    meta_df = item_targets()
-    supplier_id = choose_supplier_id()
+    need  = int(row.inventoryaverage) - int(row.totalqty)
+    if need <= 0:
+        return
 
-    log: list[str] = []
-    batch_inv: list[dict] = []
-    poid = None       # create lazily when first needed
+    # 1⃣ Create synthetic PO header (status='Completed')
+    poid = rh.create_manual_po(supplier_id, note="AUTO INVENTORY REFILL")
 
-    for row in inv_df.itertuples(index=False):
-        iid   = int(row.itemid)
-        qty   = int(row.qty)
+    # 2⃣ Add PO line & cost row (zero cost for simulation)
+    rh.add_po_item(poid, int(row.itemid), need, 0.0)
+    costid = rh.insert_poitem_cost(
+        poid, int(row.itemid), 0.0, need, note="Auto‑refill"
+    )
 
-        # derive reorder point & target
-        meta = meta_df.loc[iid] if iid in meta_df.index else None
-        thresh = int(meta.shelfthreshold) if meta is not None and pd.notna(meta.shelfthreshold) else 10
-        avg    = int(meta.shelfaverage)   if meta is not None and pd.notna(meta.shelfaverage)   else 20
-        reorder_point = max(2 * avg, 3 * thresh, 50)   # fallback 50
-        target_stock  = reorder_point + avg            # aim a bit higher
+    # 3⃣ Insert inventory layer (today’s date, dummy location 'AUTO')
+    rh.add_items_to_inventory([{
+        "item_id"         : int(row.itemid),
+        "quantity"        : need,
+        "expiration_date" : date.today(),     # fresh stock
+        "storage_location": "AUTO",
+        "cost_per_unit"   : 0.0,
+        "poid"            : poid,
+        "costid"          : costid,
+    }])
 
-        if qty < reorder_point:
-            topup_qty = target_stock - qty
-            cost      = synthetic_cost(iid)
+    rh.refresh_po_total_cost(poid)  # remains 0.0
 
-            # create synthetic PO header the first time we need it
-            if poid is None:
-                poid = recv.create_manual_po(supplier_id,
-                                             note="[AUTO‑REFILL]")
-                log.append(f"📝 Created synthetic PO #{poid}")
+# ───────────────────────── UI & loop ───────────────────────
+st.set_page_config(page_title="Auto‑Inventory Refill", page_icon="📦",
+                   layout="wide")
+st.title("📦 Auto‑Inventory Refill Monitor")
 
-            recv.add_po_item(poid, iid, topup_qty, cost)
-            costid = recv.insert_poitem_cost(
-                poid, iid, cost, topup_qty, note="Auto‑inventory‑refill"
-            )
-            batch_inv.append({
-                "item_id":          iid,
-                "quantity":         topup_qty,
-                "expiration_date":  date.today() + timedelta(days=365),
-                "storage_location": "BACK‑STORE",
-                "cost_per_unit":    cost,
-                "poid":             poid,
-                "costid":           costid,
-            })
-            log.append(
-                f"📦 Re‑ordered {topup_qty:>5} x {row.itemname} "
-                f"(inv {qty} < reorder {reorder_point})"
-            )
-
-    # commit inventory rows & refresh PO cost
-    if batch_inv:
-        recv.add_items_to_inventory(batch_inv)
-        recv.refresh_po_total_cost(poid)
-        log.append(f"✅ Received {len(batch_inv)} lines into inventory.")
-    else:
-        log.append("👍 All SKUs above reorder points – no action.")
-    return log
-
-# ───────────────────────── UI output ───────────────────────
-try:
-    messages = auto_replenish()
-except Exception as e:
-    st.error(f"Auto‑refill error: {e}")
+# pick a supplier for synthetic POs
+suppliers = rh.get_suppliers()
+if suppliers.empty:
+    st.error("No suppliers found – add at least one supplier first.")
     st.stop()
 
-for msg in messages:
-    if msg.startswith("📦") or msg.startswith("📝"):
-        st.write(msg)
-    elif msg.startswith("✅"):
-        st.success(msg)
-    else:
-        st.info(msg)
+supplier_map = dict(zip(suppliers.suppliername, suppliers.supplierid))
+default_supplier = suppliers.suppliername.iloc[0]
 
-st.divider()
-st.subheader("Current inventory snapshot (top 50 by qty)")
-snapshot = current_inventory().sort_values("qty", ascending=False).head(50)
-st.dataframe(snapshot, use_container_width=True)
+supplier_name = st.selectbox("Supplier used for auto‑refills",
+                             list(supplier_map.keys()),
+                             index=list(supplier_map.keys()).index(
+                                 default_supplier))
+supplier_id = supplier_map[supplier_name]
+
+# autorefresh (Streamlit ≥ 1.33)
+if hasattr(st, "autorefresh"):
+    st.autorefresh(interval=5000, key="inv_refill_refresh")
+
+# fetch current data
+stock_df = get_stock_levels()
+
+# decide which items need refill
+need_df = stock_df[stock_df.totalqty < stock_df.inventorythreshold]
+
+st.metric("Items below threshold", len(need_df))
+st.metric("Total SKUs", len(stock_df))
+
+if not need_df.empty:
+    st.subheader("Triggering auto‑refill for:")
+    st.dataframe(
+        need_df[["itemnameenglish", "totalqty",
+                 "inventorythreshold", "inventoryaverage"]],
+        use_container_width=True,
+    )
+
+    # perform restock (one DB commit per item)
+    for _, r in need_df.iterrows():
+        restock_item(r, supplier_id)
+
+    st.success(f"{len(need_df)} item(s) restocked (synthetic PO(s) created).")
+else:
+    st.info("All items are above their inventory thresholds.")
+
+st.subheader("Current inventory snapshot")
+st.dataframe(
+    stock_df[["itemnameenglish", "totalqty",
+              "inventorythreshold", "inventoryaverage"]]
+        .sort_values("itemnameenglish"),
+    use_container_width=True,
+)
