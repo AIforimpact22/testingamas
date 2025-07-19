@@ -1,10 +1,6 @@
 # pages/auto_inventory_refill.py
 """
-Auto‑Inventory Refill Monitor
-─────────────────────────────
-Runs every 15 seconds.  When warehouse stock for an item is below its
-`shelfthreshold` it creates a synthetic PO (supplier fetched from
-itemsupplier) and tops the item up to `shelfaverage`.
+Auto‑Inventory Refill Monitor (supplier auto‑lookup)
 """
 
 from __future__ import annotations
@@ -22,24 +18,20 @@ def snapshot() -> pd.DataFrame:
     return irh._stock_levels()
 
 def restock(df_need: pd.DataFrame) -> pd.DataFrame:
-    acts = []
+    out = []
     for _, row in df_need.iterrows():
         need = int(row.inventoryaverage) - int(row.totalqty)
-        poid = irh.restock_item(int(row.itemid), need)
-        acts.append(
-            {
-                "item": row.itemnameenglish,
-                "added": need,
-                "poid": poid if poid is not None else "No supplier mapping",
-            }
+        status = irh.restock_item(int(row.itemid), need)
+        out.append(
+            {"item": row.itemnameenglish, "added": need, "status": status}
         )
-    return pd.DataFrame(acts)
+    return pd.DataFrame(out)
 
-# ───────── throttling to avoid rapid loops ─────────
+# ───────── throttling ─────────
 NOW = time.time()
-if "last_refill_ts" not in st.session_state:
-    st.session_state["last_refill_ts"] = 0.0
-ALLOW_REFILL = NOW - st.session_state["last_refill_ts"] > 10  # seconds
+if "last_refill" not in st.session_state:
+    st.session_state["last_refill"] = 0.0
+ALLOW = NOW - st.session_state["last_refill"] > 10  # seconds
 
 # ───────── UI ─────────
 st.set_page_config("Auto‑Inventory Refill", "📦")
@@ -58,13 +50,14 @@ if not below.empty:
                "inventorythreshold", "inventoryaverage"]],
         use_container_width=True,
     )
-    if ALLOW_REFILL:
-        with st.spinner("Restocking..."):
+
+    if ALLOW:
+        with st.spinner("Restocking…"):
             acts = restock(below)
-        st.session_state["last_refill_ts"] = NOW
-        st.success(f"{len(acts)} item(s) processed.")
+        st.session_state["last_refill"] = NOW
+        st.success("Refill cycle complete.")
         st.dataframe(acts, use_container_width=True)
-        df = snapshot()  # immediate refreshed view
+        df = snapshot()
         below = df[df.totalqty < df.inventorythreshold]
 else:
     st.info("All items meet threshold.")
@@ -77,6 +70,6 @@ st.dataframe(
     use_container_width=True,
 )
 
-# Auto‑refresh every 15 s
+# auto‑refresh every 15 s
 if hasattr(st, "autorefresh"):
     st.autorefresh(interval=15000, key="inv_refresh")
