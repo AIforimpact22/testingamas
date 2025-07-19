@@ -2,13 +2,8 @@
 """
 ShelfHandler
 ============
-Centralised DB helper for every operation that touches the *Selling Area*
-(`shelf`, `shelfentries`, `shelf_shortage`, …).
-
-It is totally UI‑agnostic: no Streamlit imports, no caching — just
-database work.  Import it anywhere via
-
-    from handler.shelf_handler import ShelfHandler
+All DB helpers for the Selling Area (shelf) plus **auto‑refill helpers**
+that are called by the POS page after each sale.
 """
 
 from __future__ import annotations
@@ -20,7 +15,7 @@ __all__ = ["ShelfHandler"]
 
 
 class ShelfHandler(DatabaseManager):
-    """Inventory → Shelf movement, queries, and shortage resolution."""
+    """Inventory → Shelf movement, queries, shortage resolution, auto‑refill."""
 
     # ───────────────────────── shelf queries ─────────────────────────
     def get_shelf_items(self) -> pd.DataFrame:
@@ -50,11 +45,6 @@ class ShelfHandler(DatabaseManager):
         *,
         cur=None,
     ) -> None:
-        """
-        Upsert (item + expiry + cost) into shelf **and** write a shelfentries
-        movement log.  If *cur* is provided, we reuse that open cursor so the
-        caller can wrap multiple steps in one outer transaction.
-        """
         own_cursor = cur is None
         if own_cursor:
             self._ensure_live_conn()
@@ -100,7 +90,7 @@ class ShelfHandler(DatabaseManager):
             """
         )
 
-    # ───────────── fast transfer: Inventory → Shelf (one commit) ────────────
+    # ─────────── fast transfer: Inventory → Shelf (one commit) ────────────
     def transfer_from_inventory(
         self,
         itemid: int,
@@ -109,10 +99,6 @@ class ShelfHandler(DatabaseManager):
         cost_per_unit: float,
         created_by: str,
     ) -> None:
-        """
-        Move a *single* cost layer from **Inventory** to **Shelf** atomically.
-        Fails (and rolls back) if inventory doesn’t have enough of that layer.
-        """
         self._ensure_live_conn()
         with self.conn:                       # one BEGIN/COMMIT block
             with self.conn.cursor() as cur:
@@ -131,7 +117,6 @@ class ShelfHandler(DatabaseManager):
                 if cur.rowcount == 0:
                     raise ValueError("Not enough stock in that inventory layer.")
 
-                # Upsert into shelf and log entry using the SAME cursor
                 self.add_to_shelf(
                     itemid, expirationdate, quantity,
                     created_by, cost_per_unit, cur=cur
@@ -225,10 +210,6 @@ class ShelfHandler(DatabaseManager):
     def resolve_shortages(
         self, *, itemid: int, qty_need: int, user: str
     ) -> int:
-        """
-        Consume open shortages for *itemid* (oldest first) and return the
-        quantity still **uncovered** (≥0).
-        """
         rows = self.fetch_data(
             """
             SELECT shortageid, shortage_qty
@@ -246,7 +227,6 @@ class ShelfHandler(DatabaseManager):
                 break
             take = min(remaining, int(r.shortage_qty))
 
-            # shrink or resolve the shortage
             self.execute_command(
                 """
                 UPDATE shelf_shortage
@@ -262,8 +242,60 @@ class ShelfHandler(DatabaseManager):
             )
             remaining -= take
 
-        # tidy‑up zero rows
-        self.execute_command(
-            "DELETE FROM shelf_shortage WHERE shortage_qty = 0;"
-        )
+        self.execute_command("DELETE FROM shelf_shortage WHERE shortage_qty = 0;")
         return remaining
+
+    # ───────── auto‑refill helpers (called by POS) ─────────
+    def restock_item(self, itemid: int, *, user: str = "AUTOSIM") -> None:
+        """Bring shelf stock for *itemid* up to its threshold/average."""
+        kpis = self.get_shelf_quantity_by_item()
+        row  = kpis.loc[kpis.itemid == itemid]
+
+        current   = int(row.totalquantity.iloc[0]) if not row.empty else 0
+        threshold = int(row.shelfthreshold.iloc[0] or 0)
+        target    = int(row.shelfaverage  .iloc[0] or threshold or 0)
+
+        if current >= threshold:
+            return  # already healthy
+
+        need = max(target - current, threshold - current)
+
+        # 1️⃣  resolve open shortages first
+        need = self.resolve_shortages(itemid=itemid, qty_need=need, user=user)
+        if need <= 0:
+            return
+
+        # 2️⃣  move oldest inventory layers → shelf
+        layers = self.fetch_data(
+            """
+            SELECT expirationdate, quantity, cost_per_unit
+            FROM   inventory
+            WHERE  itemid = %s AND quantity > 0
+            ORDER  BY expirationdate, cost_per_unit;
+            """,
+            (itemid,),
+        )
+        for lyr in layers.itertuples():
+            take = min(need, int(lyr.quantity))
+            self.transfer_from_inventory(
+                itemid, lyr.expirationdate, take,
+                float(lyr.cost_per_unit), user
+            )
+            need -= take
+            if need <= 0:
+                break
+
+        # 3️⃣  still short? → log shortage ticket
+        if need > 0:
+            self.execute_command(
+                """
+                INSERT INTO shelf_shortage (itemid, shortage_qty, logged_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP);
+                """,
+                (itemid, need),
+            )
+
+    def post_sale_restock(self, cart: list[dict], *, user: str = "AUTOSIM"):
+        """Call once per successful sale to refill every sold SKU."""
+        for entry in cart:
+            self.restock_item(int(entry["itemid"]), user=user)
