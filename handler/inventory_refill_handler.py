@@ -2,21 +2,22 @@
 """
 InventoryRefillHandler
 ======================
-Automates warehouse‑level refills whenever an SKU’s inventory total
-drops under its threshold.
-
-Defaults:
-• inventorythreshold (if NULL / missing) → 50
-• inventoryaverage   (if NULL / missing) → 100
+Automates warehouse‑level refills when inventory dips below thresholds.
 """
 
 from __future__ import annotations
 from datetime import date
-
+import importlib
 import pandas as pd
 
-# ⬇️  CORRECT import path – ReceiveHandler lives in project root
-from receive_handler import ReceiveHandler
+# ── Robust import: supports either `receive_handler.py`
+#    at repo root *or* inside handler/ package.
+try:
+    ReceiveHandler = importlib.import_module(
+        "handler.receive_handler"
+    ).ReceiveHandler
+except ModuleNotFoundError:
+    ReceiveHandler = importlib.import_module("receive_handler").ReceiveHandler
 
 DEFAULT_THRESHOLD = 50
 DEFAULT_AVERAGE   = 100
@@ -25,6 +26,10 @@ DEFAULT_AVERAGE   = 100
 class InventoryRefillHandler(ReceiveHandler):
     # ───────────────────── stock snapshot ─────────────────────
     def _stock_levels(self) -> pd.DataFrame:
+        """
+        Return current inventory totals merged with thresholds/averages.
+        Missing values default to 50 / 100.
+        """
         inv = self.fetch_data(
             """
             SELECT itemid, SUM(quantity) AS totalqty
@@ -47,7 +52,7 @@ class InventoryRefillHandler(ReceiveHandler):
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ───────────────────── single‑item restock ─────────────────────
+    # ─────────────────── single‑item restock ───────────────────
     def restock_item(
         self,
         itemid: int,
@@ -57,7 +62,7 @@ class InventoryRefillHandler(ReceiveHandler):
         cost_per_unit: float = 0.0,
         note: str = "Auto‑Inventory Refill",
     ) -> int:
-        """Create synthetic PO, insert inventory; return new POID."""
+        """Create synthetic PO, insert inventory layer, return new POID."""
         if need <= 0:
             return -1
 
@@ -80,7 +85,7 @@ class InventoryRefillHandler(ReceiveHandler):
         self.refresh_po_total_cost(poid)
         return poid
 
-    # ───────────────────── bulk checker ─────────────────────
+    # ─────────────────── bulk check & refill ───────────────────
     def check_and_restock_all(
         self,
         supplier_id: int,
@@ -88,8 +93,8 @@ class InventoryRefillHandler(ReceiveHandler):
         dry_run: bool = False,
     ) -> pd.DataFrame:
         """
-        Restock every SKU below threshold up to average.
-        Returns a DataFrame summarising actions.
+        Refill every SKU below threshold.  Returns summary DataFrame.
+        If *dry_run* is True, no DB writes are made.
         """
         df    = self._stock_levels()
         needs = df[df.totalqty < df.inventorythreshold].copy()
@@ -102,15 +107,13 @@ class InventoryRefillHandler(ReceiveHandler):
                 poid = self.restock_item(
                     int(row.itemid), supplier_id, need_units
                 )
-
             actions.append({
-                "itemid"       : int(row.itemid),
-                "itemname"     : row.itemnameenglish,
-                "current_qty"  : int(row.totalqty),
-                "threshold"    : int(row.inventorythreshold),
-                "target_stock" : int(row.inventoryaverage),
-                "units_added"  : need_units,
-                "poid"         : poid,
+                "itemid"      : int(row.itemid),
+                "itemname"    : row.itemnameenglish,
+                "current_qty" : int(row.totalqty),
+                "threshold"   : int(row.inventorythreshold),
+                "target"      : int(row.inventoryaverage),
+                "added"       : need_units,
+                "poid"        : poid,
             })
-
         return pd.DataFrame(actions)
