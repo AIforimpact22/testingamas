@@ -2,24 +2,27 @@
 """
 Bulk POS Sale Simulation
 ────────────────────────
-Generates synthetic sales and pushes them through CashierHandler.process_sale_with_shortage.
+Generates synthetic sales and auto‑refills the shelf immediately
+after each successful sale.
 """
 
-import streamlit as st
+import json
+import random
+
 import pandas as pd
-import random, json
 import psycopg2
+import streamlit as st
 
-# NEW IMPORT PATH  → handlers now live under handler/
 from handler.cashier_handler import CashierHandler
+from handler.shelf_handler   import ShelfHandler
 
-cashier_handler = CashierHandler()
+cashier = CashierHandler()
+shelf   = ShelfHandler()
 
 # ───────────────────────── helpers ──────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
 def get_item_catalogue() -> pd.DataFrame:
-    """Fetch the active item catalogue (id • name • price)."""
-    return cashier_handler.fetch_data(
+    return cashier.fetch_data(
         """
         SELECT itemid,
                itemnameenglish AS itemname,
@@ -33,15 +36,13 @@ def get_item_catalogue() -> pd.DataFrame:
 
 def random_cart(
     cat_df: pd.DataFrame,
-    min_items: int = 2,
-    max_items: int = 6,
-    min_qty: int   = 1,
-    max_qty: int   = 5,
+    min_items: int,
+    max_items: int,
+    min_qty: int,
+    max_qty: int,
 ) -> list[dict]:
-    """Build a random cart with *unique* items."""
     n_items = random.randint(min_items, min(max_items, len(cat_df)))
     picks   = cat_df.sample(n=n_items, replace=False)
-
     return [
         {
             "itemid"      : int(r.itemid),
@@ -53,17 +54,13 @@ def random_cart(
 
 
 def sync_sequences() -> None:
-    """
-    Align SERIAL / IDENTITY sequences with current MAX(pk)+1.
-    Call before the bulk run and after any duplicate‑key error.
-    """
     targets = [
         ("sales",          "saleid"),
         ("salesitems",     "salesitemid"),
         ("shelf_shortage", "shortageid"),
     ]
     for tbl, pk in targets:
-        cashier_handler.execute_command(
+        cashier.execute_command(
             f"""
             SELECT setval(
                 pg_get_serial_sequence('{tbl}', '{pk}'),
@@ -82,7 +79,6 @@ def run_bulk_test() -> None:
         st.error("Catalogue is empty – cannot run simulation.")
         return
 
-    # ― user parameters ―
     col1, col2 = st.columns(2)
     with col1:
         num_sales = st.number_input("Number of test sales", 1, 500, 20)
@@ -106,7 +102,7 @@ def run_bulk_test() -> None:
 
                 while attempt < 2:  # retry at most once
                     try:
-                        saleid, shortages = cashier_handler.process_sale_with_shortage(
+                        saleid, shortages = cashier.process_sale_with_shortage(
                             cart_items     = cart,
                             discount_rate  = 0.0,
                             payment_method = pay_method,
@@ -118,17 +114,21 @@ def run_bulk_test() -> None:
                         )
                         break
                     except psycopg2.errors.UniqueViolation as e:
-                        cashier_handler.conn.rollback()
-                        sync_sequences()  # realign sequences then retry
+                        cashier.conn.rollback()
+                        sync_sequences()
                         attempt += 1
                         msg = (
                             f"UniqueViolation on retry {attempt}: "
                             f"{e.diag.constraint_name}"
                         )
                     except Exception as e:
-                        cashier_handler.conn.rollback()
+                        cashier.conn.rollback()
                         msg = f"DB error: {e}"
                         break
+
+                # 💡 NEW: auto‑refill shelves after each successful sale
+                if saleid:
+                    shelf.post_sale_restock(cart, user="AUTOSIM")
 
                 results.append(
                     {
@@ -144,6 +144,6 @@ def run_bulk_test() -> None:
         st.dataframe(pd.DataFrame(results))
 
 
-# ───────────────────────── run page (Streamlit) ────────────────────
+# ───────────────────────── run page ──────────────────────────
 st.set_page_config(page_title="Bulk POS Simulator", page_icon="🧪")
 run_bulk_test()
