@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 import pandas as pd
 from psycopg2.extras import execute_values
+
 from db_handler import DatabaseManager
 
 DEFAULT_THRESHOLD = 50
@@ -10,16 +11,16 @@ DEFAULT_AVERAGE   = 100
 
 
 class InventoryRefillHandler(DatabaseManager):
-    # ───────────────────────── snapshot ─────────────────────────
+    # ───────── snapshot (inv + thresholds) ─────────
     def _stock_levels(self) -> pd.DataFrame:
-        inv_totals = self.fetch_data(
+        inv = self.fetch_data(
             """
             SELECT itemid, SUM(quantity) AS totalqty
             FROM   inventory
             GROUP  BY itemid;
             """
         )
-        item_meta = self.fetch_data(
+        meta = self.fetch_data(
             f"""
             SELECT itemid,
                    itemnameenglish,
@@ -28,17 +29,17 @@ class InventoryRefillHandler(DatabaseManager):
             FROM   item;
             """
         )
-        df = item_meta.merge(inv_totals, on="itemid", how="left")
+        df = meta.merge(inv, on="itemid", how="left")
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ───────────────────────── suppliers ────────────────────────
+    # ───────── suppliers helper ─────────
     def get_suppliers(self) -> pd.DataFrame:
         return self.fetch_data(
             "SELECT supplierid, suppliername FROM supplier ORDER BY suppliername"
         )
 
-    # ─────────────── PO / cost / inventory helpers ──────────────
+    # ───────── PO & inventory primitives ─────────
     def create_manual_po(self, supplier_id: int, note="AUTO REFILL") -> int:
         return int(
             self.execute_command_returning(
@@ -46,9 +47,10 @@ class InventoryRefillHandler(DatabaseManager):
                 INSERT INTO purchaseorders
                       (supplierid, status, orderdate, expecteddelivery,
                        actualdelivery, createdby, suppliernote, totalcost)
-                VALUES (%s, 'Completed', CURRENT_DATE, CURRENT_DATE,
-                        CURRENT_DATE, 'AutoInventory', %s, 0.0)
-                RETURNING poid;""",
+                VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,
+                        CURRENT_DATE,'AutoInventory',%s,0)
+                RETURNING poid;
+                """,
                 (supplier_id, note),
             )[0]
         )
@@ -57,8 +59,9 @@ class InventoryRefillHandler(DatabaseManager):
         self.execute_command(
             """
             INSERT INTO purchaseorderitems
-                  (poid, itemid, orderedquantity, receivedquantity, estimatedprice)
-            VALUES (%s, %s, %s, %s, %s);""",
+                  (poid,itemid,orderedquantity,receivedquantity,estimatedprice)
+            VALUES (%s,%s,%s,%s,%s);
+            """,
             (poid, item_id, qty, qty, cost),
         )
 
@@ -68,10 +71,11 @@ class InventoryRefillHandler(DatabaseManager):
         return int(
             self.execute_command_returning(
                 """
-                INSERT INTO poitemcost (poid, itemid, cost_per_unit,
-                                        quantity, cost_date, note)
-                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, %s)
-                RETURNING costid;""",
+                INSERT INTO poitemcost (poid,itemid,cost_per_unit,
+                                        quantity,cost_date,note)
+                VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,%s)
+                RETURNING costid;
+                """,
                 (poid, item_id, cpu, qty, note),
             )[0]
         )
@@ -89,32 +93,31 @@ class InventoryRefillHandler(DatabaseManager):
             )
             for r in rows
         ]
+        sql = """
+            INSERT INTO inventory
+                  (itemid,quantity,expirationdate,
+                   storagelocation,cost_per_unit,poid,costid)
+            VALUES %s;
+        """
         self._ensure_live_conn()
-        with self.conn:
-            with self.conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO inventory
-                          (itemid, quantity, expirationdate,
-                           storagelocation, cost_per_unit, poid, costid)
-                    VALUES %s;""",
-                    tuples,
-                )
+        cur = self.conn.cursor()
+        execute_values(cur, sql, tuples)
+        self.conn.commit()
+        cur.close()
 
     def refresh_po_total_cost(self, poid: int):
         self.execute_command(
             """
             UPDATE purchaseorders
             SET    totalcost = COALESCE((
-                     SELECT SUM(quantity * cost_per_unit)
-                     FROM   poitemcost
-                     WHERE  poid = %s),0)
-            WHERE  poid = %s;""",
+                     SELECT SUM(quantity*cost_per_unit)
+                     FROM   poitemcost WHERE poid=%s),0)
+            WHERE  poid=%s;
+            """,
             (poid, poid),
         )
 
-    # ───────────────────── restock one item ─────────────────────
+    # ───────── refill one SKU ─────────
     def restock_item(
         self,
         itemid: int,
@@ -124,7 +127,6 @@ class InventoryRefillHandler(DatabaseManager):
         cpu: float = 0.0,
         note="AUTO REFILL",
     ) -> int:
-        """Return new POID or −1 if nothing needed."""
         if need <= 0:
             return -1
         poid = self.create_manual_po(supplier_id, note)
