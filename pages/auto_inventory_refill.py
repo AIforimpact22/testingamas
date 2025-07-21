@@ -1,87 +1,122 @@
-import streamlit as st
-if not st.session_state.get("sim_active", True):
-    st.stop()          # abort the page run immediately
-  
 from __future__ import annotations
 """
-Auto‑Inventory Refill Monitor
-─────────────────────────────
-• Checks inventory every 15 s.
-• If total stock < `threshold`, it creates a synthetic PO (supplier is taken
-  automatically from the itemsupplier table) and tops the item up to
-  `averagerequired`.
+Shelf Auto‑Refill (passive)
+───────────────────────────
+Checks shelf stock every 10 s and moves inventory to shelf up to each
+item’s threshold / average levels.  No UI controls; execution is stopped
+when the “Simulators running” toggle (in *app.py*) is OFF.
 """
 
-import time
 import streamlit as st
 import pandas as pd
-from handler.inventory_refill_handler import InventoryRefillHandler
+import time
+from handler.shelf_handler import ShelfHandler
 
-irh = InventoryRefillHandler()
-
-# ───────── helpers ─────────
-@st.cache_data(ttl=5, show_spinner=False)
-def snapshot() -> pd.DataFrame:
-    return irh._stock_levels()
-
-def restock(df_need: pd.DataFrame) -> pd.DataFrame:
-    actions = []
-    for _, row in df_need.iterrows():
-        need = int(row.inventoryaverage) - int(row.totalqty)
-        status = irh.restock_item(int(row.itemid), need)
-        actions.append(
-            {"item": row.itemnameenglish, "added": need, "status": status}
-        )
-    return pd.DataFrame(actions)
-
-# ───────── throttling (10 s) ─────────
-now = time.time()
-if "last_refill" not in st.session_state:
-    st.session_state["last_refill"] = 0.0
-allow_refill = now - st.session_state["last_refill"] > 10  # seconds
-
-# ───────── simulation master switch ─────────
+# ───────── stop if simulators are paused ─────────
 if not st.session_state.get("sim_active", True):
     st.warning("Simulators are paused (toggle in main sidebar).")
     st.stop()
 
-# ───────── UI ─────────
-st.set_page_config("Auto‑Inventory Refill", "📦")
-st.title("📦 Auto‑Inventory Refill Monitor")
+shelf = ShelfHandler()
 
-df = snapshot()
-below = df[df.totalqty < df.inventorythreshold]
+@st.cache_data(ttl=10, show_spinner=False)
+def item_meta() -> pd.DataFrame:
+    return shelf.get_all_items().set_index("itemid")     # shelfthreshold / average
 
-c1, c2 = st.columns(2)
-c1.metric("Total SKUs", len(df))
-c2.metric("Below threshold", len(below))
+# ───────────────────────── helpers ─────────────────────────
+def restock_item(itemid: int, *, user: str = "AUTO‑SHELF") -> str:
+    meta = item_meta()
+    kpi  = shelf.get_shelf_quantity_by_item()
+    rowk = kpi.loc[kpi.itemid == itemid]
+    if rowk.empty:
+        current = 0
+    else:
+        current = int(rowk.totalquantity.iloc[0])
 
-if not below.empty:
-    st.dataframe(
-        below[["itemnameenglish", "totalqty",
-               "inventorythreshold", "inventoryaverage"]],
-        use_container_width=True,
+    threshold = int(meta.at[itemid, "shelfthreshold"] or 0)
+    average   = int(meta.at[itemid, "shelfaverage"]   or threshold or 0)
+
+    if current >= threshold:
+        return "OK"
+
+    need = max(average - current, threshold - current)
+    need = shelf.resolve_shortages(itemid=itemid, qty_need=need, user=user)
+    if need <= 0:
+        return "Shortage cleared"
+
+    layers = shelf.fetch_data(
+        """
+        SELECT expirationdate, quantity, cost_per_unit
+        FROM   inventory
+        WHERE  itemid = %s AND quantity > 0
+        ORDER  BY expirationdate, cost_per_unit
+        """,
+        (itemid,),
     )
 
-    if allow_refill:
-        with st.spinner("Restocking…"):
-            acts = restock(below)
-        st.session_state["last_refill"] = now
-        st.success("Refill cycle complete.")
-        st.dataframe(acts, use_container_width=True)
-        df = snapshot()           # refreshed view
-        below = df[df.totalqty < df.inventorythreshold]
+    for lyr in layers.itertuples():
+        take = min(need, int(lyr.quantity))
+        shelf.transfer_from_inventory(
+            itemid=itemid,
+            expirationdate=lyr.expirationdate,
+            quantity=take,
+            cost_per_unit=float(lyr.cost_per_unit),
+            created_by=user,
+        )
+        need -= take
+        if need == 0:
+            return "Refilled"
+
+    # not enough inventory
+    shelf.execute_command(
+        "INSERT INTO shelf_shortage (itemid, shortage_qty, logged_at) "
+        "VALUES (%s, %s, CURRENT_TIMESTAMP)",
+        (itemid, need),
+    )
+    return f"Partial (short {need})"
+
+def auto_restock_cycle() -> pd.DataFrame:
+    kpi  = shelf.get_shelf_quantity_by_item()
+    meta = item_meta().reset_index()
+
+    # merge with explicit suffixes to avoid _x/_y surprises
+    df = kpi.merge(
+        meta[["itemid", "shelfthreshold", "shelfaverage"]],
+        on="itemid",
+        how="left",
+        suffixes=("_kpi", "_meta"),
+    )
+
+    # unified columns
+    df["threshold"] = df["shelfthreshold_meta"].fillna(df["shelfthreshold_kpi"])
+    df["average"]   = df["shelfaverage_meta"].fillna(df["shelfaverage_kpi"])
+
+    below = df[df.totalquantity < df.threshold]
+    actions = []
+    for _, r in below.iterrows():
+        status = restock_item(int(r.itemid))
+        actions.append(
+            dict(
+                item        = r.itemname,
+                qty_before  = int(r.totalquantity),
+                threshold   = int(r.threshold),
+                average     = int(r.average),
+                action      = status,
+            )
+        )
+    return pd.DataFrame(actions)
+
+# ───────────────────────── Streamlit page ─────────────────────────
+st.set_page_config("Shelf Auto‑Refill", "🗄️")
+st.title("🗄️ Shelf Auto‑Refill Monitor (passive)")
+
+log_df = auto_restock_cycle()
+if log_df.empty:
+    st.success("All shelf SKUs are at or above their thresholds.")
 else:
-    st.info("All items meet threshold.")
+    st.success(f"{len(log_df)} SKU(s) processed this cycle.")
+    st.dataframe(log_df, use_container_width=True)
 
-st.subheader("Current inventory snapshot")
-st.dataframe(
-    df[["itemnameenglish", "totalqty",
-        "inventorythreshold", "inventoryaverage"]]
-      .sort_values("itemnameenglish"),
-    use_container_width=True,
-)
-
-# auto‑refresh every 15 s
+# Auto‑refresh every 10 s
 if hasattr(st, "autorefresh"):
-    st.autorefresh(interval=15000, key="inv_refresh")
+    st.autorefresh(interval=10000, key="shelf_refill_refresh")
