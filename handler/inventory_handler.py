@@ -1,14 +1,4 @@
-"""
-InventoryHandler
-────────────────
-Refills warehouse stock whenever an SKU’s quantity drops below
-`threshold`, topping it up to `averagerequired`.
-
-* Supplier is resolved from itemsupplier.
-* Synthetic POs are zero‑cost when sellingprice is 0 / NULL,
-  otherwise cost_per_unit is 75 % of sellingprice.
-"""
-
+# handler/inventory_handler.py  (replaces previous version)
 from __future__ import annotations
 from datetime import date
 import pandas as pd
@@ -18,14 +8,11 @@ from db_handler import DatabaseManager
 DEFAULT_THRESHOLD = 50
 DEFAULT_AVERAGE   = 100
 
-
 class InventoryHandler(DatabaseManager):
-    # ───────────── snapshot ─────────────
+    # ───────── snapshot (unchanged) ─────────
     def stock_levels(self) -> pd.DataFrame:
-        inv = self.fetch_data(
-            "SELECT itemid, SUM(quantity) AS totalqty "
-            "FROM inventory GROUP BY itemid"
-        )
+        inv  = self.fetch_data("SELECT itemid, SUM(quantity) AS totalqty "
+                               "FROM inventory GROUP BY itemid")
         if inv.empty:
             inv = pd.DataFrame(columns=["itemid", "totalqty"])
 
@@ -33,120 +20,101 @@ class InventoryHandler(DatabaseManager):
             f"""
             SELECT itemid,
                    itemnameenglish,
-                   COALESCE(threshold,       {DEFAULT_THRESHOLD}) AS threshold,
-                   COALESCE(averagerequired, {DEFAULT_AVERAGE})   AS averagerequired,
-                   COALESCE(sellingprice ,0)                     AS sellingprice
+                   COALESCE(threshold,{DEFAULT_THRESHOLD})       AS threshold,
+                   COALESCE(averagerequired,{DEFAULT_AVERAGE})  AS average,
+                   COALESCE(sellingprice,0)*0.75                AS cpu     -- 25 % margin
             FROM   item
             """
         )
-
         df = meta.merge(inv, on="itemid", how="left")
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ─────────── supplier look‑up ───────────
-    def supplier_for_item(self, itemid: int) -> int | None:
+    # ───────── helpers (unchanged) ─────────
+    def supplier_for(self, itemid: int) -> int | None:
         res = self.fetch_data(
-            "SELECT supplierid FROM itemsupplier WHERE itemid=%s LIMIT 1",
-            (itemid,),
+            "SELECT supplierid FROM itemsupplier WHERE itemid=%s LIMIT 1", (itemid,)
         )
         return None if res.empty else int(res.iloc[0, 0])
 
-    # ─────────── PO helpers ───────────
-    def _create_po(self, supplier_id: int) -> int:
-        poid = self.execute_command_returning(
-            """
-            INSERT INTO purchaseorders
-                  (supplierid,status,orderdate,expecteddelivery,actualdelivery,
-                   createdby,suppliernote,totalcost)
-            VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,CURRENT_DATE,
-                    'AutoInventory','AUTO REFILL',0.0)
-            RETURNING poid
-            """,
-            (supplier_id,),
-        )[0]
-        return int(poid)
-
-    def _add_po_item(self, poid: int, itemid: int, qty: int, cpu: float):
-        self.execute_command(
-            "INSERT INTO purchaseorderitems "
-            "(poid,itemid,orderedquantity,receivedquantity,estimatedprice) "
-            "VALUES (%s,%s,%s,%s,%s)",
-            (poid, itemid, qty, qty, cpu),
-        )
-
-    def _insert_cost(self, poid: int, itemid: int,
-                     cpu: float, qty: int) -> int:
-        costid = self.execute_command_returning(
-            "INSERT INTO poitemcost "
-            "(poid,itemid,cost_per_unit,quantity,cost_date,note) "
-            "VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,'AUTO REFILL') RETURNING costid",
-            (poid, itemid, cpu, qty),
-        )[0]
-        return int(costid)
-
-    def _refresh_po_cost(self, poid: int):
-        self.execute_command(
-            "UPDATE purchaseorders "
-            "SET totalcost = COALESCE(("
-            "SELECT SUM(quantity*cost_per_unit) FROM poitemcost WHERE poid=%s"
-            "),0) WHERE poid=%s",
-            (poid, poid),
-        )
-
-    # ─────────── inventory insert ───────────
-    def _add_inventory_rows(self, rows: list[dict]):
-        tuples = [
-            (r["item_id"], r["quantity"], r["expiration_date"],
-             r["storage_location"], r["cost_per_unit"], r["poid"], r["costid"])
-            for r in rows
-        ]
+    def _bulk_insert_inventory(self, rows: list[tuple]):
+        """
+        rows -> tuples (itemid, qty, exp, loc, cpu, poid, costid)
+        executed in ONE commit.
+        """
+        if not rows:
+            return
         sql = ("INSERT INTO inventory "
                "(itemid,quantity,expirationdate,storagelocation,"
                " cost_per_unit,poid,costid) VALUES %s")
         self._ensure_live_conn()
-        with self.conn.cursor() as cur:
-            execute_values(cur, sql, tuples)
-        self.conn.commit()
+        with self.conn:
+            with self.conn.cursor() as cur:
+                execute_values(cur, sql, rows)
 
-    # ─────────── public refill ───────────
-    def refill(self, *, itemid: int, qty_needed: int) -> str:
+    # ───────── batch restock (NEW fast path) ─────────
+    def batch_restock(self, df_need: pd.DataFrame) -> list[dict]:
         """
-        Top‑up *itemid* by *qty_needed* units.
-
-        • Calculates cost_per_unit = sellingprice × 0.75 (rounded 2 d.p.).
-        • If sellingprice is 0 / NULL ⇒ cost_per_unit = 0.
+        df_need rows: itemid, need, cpu
+        Creates ONE PO per supplier and buckets items.
+        Returns action‑log for UI.
         """
-        if qty_needed <= 0:
-            return "SKIP"
+        if df_need.empty:
+            return []
 
-        supplier_id = self.supplier_for_item(itemid)
-        if supplier_id is None:
-            return "NO SUPPLIER"
+        # 1️⃣ group rows by supplier
+        buckets: dict[int, list[tuple]] = {}
+        for row in df_need.itertuples(index=False):
+            sup = self.supplier_for(int(row.itemid))
+            if sup is None:
+                continue
+            buckets.setdefault(sup, []).append(row)
 
-        # fetch sellingprice once
-        sp_df = self.fetch_data(
-            "SELECT COALESCE(sellingprice,0) AS sp FROM item WHERE itemid=%s",
-            (itemid,),
-        )
-        selling_price = float(sp_df.iloc[0, 0]) if not sp_df.empty else 0.0
-        cpu = round(selling_price * 0.75, 2) if selling_price > 0 else 0.0
+        actions, inv_rows = [], []
 
-        poid   = self._create_po(supplier_id)
-        self._add_po_item(poid, itemid, qty_needed, cpu)
-        costid = self._insert_cost(poid, itemid, cpu, qty_needed)
-        self._add_inventory_rows(
-            [
-                dict(
-                    item_id          = itemid,
-                    quantity         = qty_needed,
-                    expiration_date  = date(2027, 7, 21),   # fixed for sim
-                    storage_location = "SECTION A2",
-                    cost_per_unit    = cpu,
-                    poid             = poid,
-                    costid           = costid,
+        # 2️⃣ for each supplier create PO + rows
+        for sup, items in buckets.items():
+            poid = self.execute_command_returning(
+                "INSERT INTO purchaseorders "
+                "(supplierid,status,orderdate,expecteddelivery,actualdelivery,"
+                " createdby,suppliernote,totalcost) "
+                "VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,CURRENT_DATE,"
+                " 'AutoInventory','AUTO',0.0) RETURNING poid",
+                (sup,),
+            )[0]
+
+            for r in items:
+                # purchaseorderitems / poitemcost
+                self.execute_command(
+                    "INSERT INTO purchaseorderitems "
+                    "(poid,itemid,orderedquantity,receivedquantity,estimatedprice) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (poid, int(r.itemid), int(r.need), int(r.need), float(r.cpu)),
                 )
-            ]
-        )
-        self._refresh_po_cost(poid)
-        return f"OK PO#{poid}"
+                costid = self.execute_command_returning(
+                    "INSERT INTO poitemcost "
+                    "(poid,itemid,cost_per_unit,quantity,cost_date,note) "
+                    "VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,'AUTO') RETURNING costid",
+                    (poid, int(r.itemid), float(r.cpu), int(r.need)),
+                )[0]
+
+                inv_rows.append((
+                    int(r.itemid), int(r.need), date(2027, 7, 21),  # fixed expiry
+                    "A2", float(r.cpu), poid, costid
+                ))
+                actions.append(
+                    dict(item=r.itemnameenglish,
+                         added=int(r.need),
+                         supplier=sup,
+                         poid=poid)
+                )
+
+            # cheap total‑cost refresh
+            self.execute_command(
+                "UPDATE purchaseorders SET totalcost = (SELECT SUM(quantity*cost_per_unit)"
+                " FROM poitemcost WHERE poid=%s) WHERE poid=%s", (poid, poid)
+            )
+
+        # 3️⃣ bulk insert inventory rows
+        self._bulk_insert_inventory(inv_rows)
+        return actions
