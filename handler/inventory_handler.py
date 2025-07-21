@@ -1,4 +1,14 @@
-# handler/inventory_handler.py  (replaces previous version)
+# handler/inventory_handler.py
+"""
+InventoryHandler
+────────────────
+Bulk‑refill the back‑store inventory up to each SKU’s
+`threshold / averagerequired` (columns in `item`).
+
+* One synthetic PO **per supplier per cycle**.
+* Unit‑cost = 75 % of `sellingprice` (0 if selling price is 0/NULL).
+"""
+
 from __future__ import annotations
 from datetime import date
 import pandas as pd
@@ -7,114 +17,151 @@ from db_handler import DatabaseManager
 
 DEFAULT_THRESHOLD = 50
 DEFAULT_AVERAGE   = 100
+FIX_EXPIRY_DATE   = date(2027, 7, 21)   # ← until real values are supplied
+FIX_STORAGE_LOC   = "A2"                # ← hard‑coded warehouse slot
+
 
 class InventoryHandler(DatabaseManager):
-    # ───────── snapshot (unchanged) ─────────
+    # ───────────────────── current stock + meta ─────────────────────
     def stock_levels(self) -> pd.DataFrame:
-        inv  = self.fetch_data("SELECT itemid, SUM(quantity) AS totalqty "
-                               "FROM inventory GROUP BY itemid")
+        """Return inventory totals + threshold / average from *item*."""
+        inv = self.fetch_data(
+            "SELECT itemid, SUM(quantity)::int AS totalqty "
+            "FROM   inventory GROUP BY itemid"
+        )
         if inv.empty:
             inv = pd.DataFrame(columns=["itemid", "totalqty"])
 
         meta = self.fetch_data(
             f"""
-            SELECT itemid,
-                   itemnameenglish,
-                   COALESCE(threshold,{DEFAULT_THRESHOLD})       AS threshold,
-                   COALESCE(averagerequired,{DEFAULT_AVERAGE})  AS average,
-                   COALESCE(sellingprice,0)*0.75                AS cpu     -- 25 % margin
-            FROM   item
+            SELECT  i.itemid,
+                    i.itemnameenglish,
+                    COALESCE(i.threshold,       {DEFAULT_THRESHOLD}) AS threshold,
+                    COALESCE(i.averagerequired, {DEFAULT_AVERAGE})   AS average,
+                    COALESCE(s.sellingprice,0)  AS sellingprice
+            FROM    item i
+            LEFT JOIN (
+                SELECT itemid, MIN(sellingprice) AS sellingprice
+                FROM   item GROUP BY itemid
+            ) s USING (itemid)
             """
         )
+        # merge → every item row present even if no inventory yet
         df = meta.merge(inv, on="itemid", how="left")
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ───────── helpers (unchanged) ─────────
+    # ─────────── supplier helpers ───────────
     def supplier_for(self, itemid: int) -> int | None:
-        res = self.fetch_data(
-            "SELECT supplierid FROM itemsupplier WHERE itemid=%s LIMIT 1", (itemid,)
+        rows = self.fetch_data(
+            "SELECT supplierid FROM itemsupplier "
+            "WHERE itemid=%s LIMIT 1", (itemid,)
         )
-        return None if res.empty else int(res.iloc[0, 0])
+        return None if rows.empty else int(rows.iloc[0, 0])
 
-    def _bulk_insert_inventory(self, rows: list[tuple]):
+    # ─────────── PO helpers ───────────
+    def create_supplier_po(self, supplier_id: int) -> int:
+        poid = self.execute_command_returning(
+            """
+            INSERT INTO purchaseorders
+                  (supplierid,status,orderdate,expecteddelivery,
+                   actualdelivery,createdby,suppliernote,totalcost)
+            VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,
+                    CURRENT_DATE,'AutoInventory','AUTO BULK',0)
+            RETURNING poid;
+            """,
+            (supplier_id,)
+        )[0]
+        return int(poid)
+
+    def add_po_lines_and_costs(
+        self, poid: int, rows: list[tuple[int,int,float]]
+    ) -> list[int]:
         """
-        rows -> tuples (itemid, qty, exp, loc, cpu, poid, costid)
-        executed in ONE commit.
+        rows → [(itemid, qty, cpu), …]
+        returns list[costid]
         """
-        if not rows:
-            return
-        sql = ("INSERT INTO inventory "
-               "(itemid,quantity,expirationdate,storagelocation,"
-               " cost_per_unit,poid,costid) VALUES %s")
-        self._ensure_live_conn()
-        with self.conn:
+        po_item_rows  = []
+        po_cost_rows  = []
+        cost_ids: list[int] = []
+
+        for itemid, qty, cpu in rows:
+            po_item_rows.append((poid, itemid, qty, qty, cpu))
+            po_cost_rows.append((poid, itemid, cpu, qty, "AUTO REFILL"))
+
+        with self.conn:                                # single tx
             with self.conn.cursor() as cur:
-                execute_values(cur, sql, rows)
-
-    # ───────── batch restock (NEW fast path) ─────────
-    def batch_restock(self, df_need: pd.DataFrame) -> list[dict]:
-        """
-        df_need rows: itemid, need, cpu
-        Creates ONE PO per supplier and buckets items.
-        Returns action‑log for UI.
-        """
-        if df_need.empty:
-            return []
-
-        # 1️⃣ group rows by supplier
-        buckets: dict[int, list[tuple]] = {}
-        for row in df_need.itertuples(index=False):
-            sup = self.supplier_for(int(row.itemid))
-            if sup is None:
-                continue
-            buckets.setdefault(sup, []).append(row)
-
-        actions, inv_rows = [], []
-
-        # 2️⃣ for each supplier create PO + rows
-        for sup, items in buckets.items():
-            poid = self.execute_command_returning(
-                "INSERT INTO purchaseorders "
-                "(supplierid,status,orderdate,expecteddelivery,actualdelivery,"
-                " createdby,suppliernote,totalcost) "
-                "VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,CURRENT_DATE,"
-                " 'AutoInventory','AUTO',0.0) RETURNING poid",
-                (sup,),
-            )[0]
-
-            for r in items:
-                # purchaseorderitems / poitemcost
-                self.execute_command(
+                execute_values(
+                    cur,
                     "INSERT INTO purchaseorderitems "
                     "(poid,itemid,orderedquantity,receivedquantity,estimatedprice) "
-                    "VALUES (%s,%s,%s,%s,%s)",
-                    (poid, int(r.itemid), int(r.need), int(r.need), float(r.cpu)),
+                    "VALUES %s",
+                    po_item_rows
                 )
-                costid = self.execute_command_returning(
-                    "INSERT INTO poitemcost "
-                    "(poid,itemid,cost_per_unit,quantity,cost_date,note) "
-                    "VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,'AUTO') RETURNING costid",
-                    (poid, int(r.itemid), float(r.cpu), int(r.need)),
-                )[0]
+                cur.execute("SELECT currval('purchaseorderitems_poiid_seq');")
+                # we do cost rows one‑by‑one so we get their IDs
+                for poid_, itemid, cpu, qty, note in po_cost_rows:
+                    cur.execute(
+                        "INSERT INTO poitemcost "
+                        "(poid,itemid,cost_per_unit,quantity,cost_date,note) "
+                        "VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,%s) RETURNING costid",
+                        (poid_, itemid, cpu, qty, note)
+                    )
+                    cost_ids.append(int(cur.fetchone()[0]))
+        return cost_ids
 
-                inv_rows.append((
-                    int(r.itemid), int(r.need), date(2027, 7, 21),  # fixed expiry
-                    "A2", float(r.cpu), poid, costid
-                ))
-                actions.append(
-                    dict(item=r.itemnameenglish,
-                         added=int(r.need),
-                         supplier=sup,
-                         poid=poid)
-                )
-
-            # cheap total‑cost refresh
-            self.execute_command(
-                "UPDATE purchaseorders SET totalcost = (SELECT SUM(quantity*cost_per_unit)"
-                " FROM poitemcost WHERE poid=%s) WHERE poid=%s", (poid, poid)
+    # ─────────── inventory bulk insert ───────────
+    def bulk_inventory_rows(
+        self,
+        item_rows: list[tuple[int,int,float,int,int]]
+    ) -> None:
+        """
+        item_rows → (itemid, qty, cpu, poid, costid)
+        """
+        tuples = [
+            (itemid, qty, FIX_EXPIRY_DATE, FIX_STORAGE_LOC, cpu, poid, costid)
+            for itemid, qty, cpu, poid, costid in item_rows
+        ]
+        with self.conn.cursor() as cur:
+            execute_values(
+                cur,
+                "INSERT INTO inventory "
+                "(itemid,quantity,expirationdate,storagelocation,"
+                " cost_per_unit,poid,costid) VALUES %s",
+                tuples
             )
+        self.conn.commit()
 
-        # 3️⃣ bulk insert inventory rows
-        self._bulk_insert_inventory(inv_rows)
-        return actions
+    # ─────────── public restock API ───────────
+    def restock_items_bulk(self, df_need: pd.DataFrame) -> list[dict]:
+        """
+        Accepts a **need dataframe** (itemid, need, sellingprice).
+        Creates one PO per supplier and inserts inventory layers in bulk.
+        Returns action log rows.
+        """
+        # 1️⃣ group by supplier
+        df_need["supplier"] = df_need["itemid"].apply(self.supplier_for)
+        df_need.dropna(subset=["supplier"], inplace=True)
+
+        log: list[dict] = []
+        for supplier_id, group in df_need.groupby("supplier"):
+            poid = self.create_supplier_po(int(supplier_id))
+
+            # prepare PO‑line tuples & inventory rows
+            po_rows      = []
+            inv_rows     = []
+            for _, row in group.iterrows():
+                cpu  = round(float(row.sellingprice) * 0.75, 2)
+                po_rows.append((int(row.itemid), int(row.need), cpu))
+            cost_ids = self.add_po_lines_and_costs(
+                poid, [(r[0], r[1], r[2]) for r in po_rows]
+            )
+            # pair po_rows with returned cost_ids
+            for (itemid, qty, cpu), costid in zip(po_rows, cost_ids):
+                inv_rows.append((itemid, qty, cpu, poid, costid))
+                log.append(
+                    dict(itemid=itemid, added=qty, cpu=cpu, poid=poid)
+                )
+
+            self.bulk_inventory_rows(inv_rows)
+        return log
