@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 import streamlit as st
 import pandas as pd
-from handler.shelf_handler import ShelfHandler
+from handler.selling_area_handler import SellingAreaHandler
 
 # ───────────── page config ─────────────
 st.set_page_config(page_title="Shelf Auto‑Refill", page_icon="🗄️")
@@ -40,7 +40,7 @@ if col_stop.button("⏹ Stop", disabled=not RUNNING):
     RUNNING = False
 
 # ───────────── data helpers ─────────────
-shelf = ShelfHandler()
+shelf = SellingAreaHandler()
 DUMMY_SALEID = 0
 
 @st.cache_data(ttl=300, show_spinner=False)
