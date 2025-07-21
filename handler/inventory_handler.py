@@ -1,38 +1,47 @@
 """
 InventoryHandler
 ────────────────
-Refills warehouse inventory automatically whenever an SKU’s stock
-falls below its `threshold`, topping it up to `averagerequired`.
+Refills warehouse inventory whenever an SKU’s on‑hand quantity
+falls below its `threshold`, topping it up to `average_required`.
 
-• Supplier is resolved via itemsupplier.
-• Each refill uses a synthetic PO (status = Completed, cost = 0).
+• Supplier is auto‑resolved from `itemsupplier`.
+• All synthetic POs are created with zero cost (simulation).
+• If no inventory is present the merge still succeeds.
 """
 
 from __future__ import annotations
+
 from datetime import date
 import pandas as pd
 from psycopg2.extras import execute_values
 from db_handler import DatabaseManager
+
 
 DEFAULT_THRESHOLD = 50
 DEFAULT_AVERAGE   = 100
 
 
 class InventoryHandler(DatabaseManager):
-    # ───────────────────── current snapshot ─────────────────────
+    # ───────────────────────── inventory snapshot ─────────────────────────
     def stock_levels(self) -> pd.DataFrame:
-        """Return inventory qty merged with per‑item thresholds/averages."""
+        """
+        Return a DataFrame with:
+        itemid · itemnameenglish · threshold · average_required · totalqty
+        Robust to an empty inventory table.
+        """
         inv = self.fetch_data(
-            "SELECT itemid, COALESCE(SUM(quantity),0) AS totalqty "
+            "SELECT itemid, SUM(quantity) AS totalqty "
             "FROM inventory GROUP BY itemid"
         )
+        if inv.empty:                                # ensure expected columns
+            inv = pd.DataFrame(columns=["itemid", "totalqty"])
 
         meta = self.fetch_data(
             f"""
             SELECT itemid,
                    itemnameenglish,
                    COALESCE(threshold,       {DEFAULT_THRESHOLD}) AS threshold,
-                   COALESCE(averagerequired, {DEFAULT_AVERAGE})   AS average_required
+                   COALESCE(average_required,{DEFAULT_AVERAGE})   AS average_required
             FROM   item
             """
         )
@@ -41,15 +50,15 @@ class InventoryHandler(DatabaseManager):
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ───────────────────── supplier lookup ─────────────────────
+    # ───────────────────────── supplier helpers ──────────────────────────
     def supplier_for_item(self, itemid: int) -> int | None:
-        res = self.fetch_data(
+        df = self.fetch_data(
             "SELECT supplierid FROM itemsupplier WHERE itemid = %s LIMIT 1",
             (itemid,),
         )
-        return None if res.empty else int(res.iloc[0, 0])
+        return None if df.empty else int(df.iloc[0, 0])
 
-    # ───────────────────── PO helpers ──────────────────────────
+    # ───────────────────────── PO helpers ────────────────────────────────
     def _create_po(self, supplier_id: int, note="AUTO REFILL") -> int:
         poid = self.execute_command_returning(
             """
@@ -64,87 +73,96 @@ class InventoryHandler(DatabaseManager):
         )[0]
         return int(poid)
 
-    def _add_po_line(self, poid: int, itemid: int, qty: int, cpu: float):
+    def _add_po_item(self, poid: int, itemid: int, qty: int, cpu: float = 0.0):
         self.execute_command(
-            "INSERT INTO purchaseorderitems "
-            "(poid,itemid,orderedquantity,receivedquantity,estimatedprice) "
-            "VALUES (%s,%s,%s,%s,%s)",
+            """
+            INSERT INTO purchaseorderitems
+                  (poid,itemid,orderedquantity,receivedquantity,estimatedprice)
+            VALUES (%s,%s,%s,%s,%s)
+            """,
             (poid, itemid, qty, qty, cpu),
         )
 
-    def _add_cost_row(self, poid: int, itemid: int, cpu: float, qty: int, note: str) -> int:
+    def _insert_cost(self, poid: int, itemid: int, cpu: float,
+                     qty: int, note="AUTO REFILL") -> int:
         costid = self.execute_command_returning(
-            "INSERT INTO poitemcost "
-            "(poid,itemid,cost_per_unit,quantity,cost_date,note) "
-            "VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,%s) RETURNING costid",
+            """
+            INSERT INTO poitemcost
+                  (poid,itemid,cost_per_unit,quantity,cost_date,note)
+            VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,%s)
+            RETURNING costid
+            """,
             (poid, itemid, cpu, qty, note),
         )[0]
         return int(costid)
 
-    def _insert_inventory_layer(
-        self,
-        itemid: int,
-        qty: int,
-        poid: int,
-        costid: int,
-        *,
-        cpu: float = 0.0,
-        expiry=date(2027, 7, 21),
-        location="A2",
-    ):
-        self.add_inventory_rows(
+    def _refresh_po_cost(self, poid: int):
+        self.execute_command(
+            """
+            UPDATE purchaseorders
+            SET totalcost = COALESCE((
+                SELECT SUM(quantity*cost_per_unit)
+                FROM   poitemcost
+                WHERE  poid = %s
+            ),0)
+            WHERE poid = %s
+            """,
+            (poid, poid),
+        )
+
+    # ───────────────────────── inventory insert ──────────────────────────
+    def _add_inventory_rows(self, rows: list[dict]):
+        tuples = [
+            (
+                r["item_id"],          # 1
+                r["quantity"],         # 2
+                r["expiration_date"],  # 3
+                r["storage_location"], # 4
+                r["cost_per_unit"],    # 5
+                r["poid"],             # 6
+                r["costid"],           # 7
+            )
+            for r in rows
+        ]
+        sql = (
+            "INSERT INTO inventory "
+            "(itemid,quantity,expirationdate,storagelocation,"
+            " cost_per_unit,poid,costid) VALUES %s"
+        )
+        self._ensure_live_conn()
+        with self.conn.cursor() as cur:
+            execute_values(cur, sql, tuples)
+        self.conn.commit()
+
+    # ───────────────────────── public refill ─────────────────────────────
+    def refill(self, *, itemid: int, qty_needed: int,
+               cpu: float = 0.0) -> str:
+        """
+        Top‑up *itemid* by *qty_needed* units.
+        Returns a status string for UI.
+        """
+        if qty_needed <= 0:
+            return "SKIP"
+
+        sup_id = self.supplier_for_item(itemid)
+        if sup_id is None:
+            return "NO SUPPLIER"
+
+        poid = self._create_po(sup_id)
+        self._add_po_item(poid, itemid, qty_needed, cpu)
+        costid = self._insert_cost(poid, itemid, cpu, qty_needed)
+        self._add_inventory_rows(
             [
                 dict(
                     item_id=itemid,
-                    quantity=qty,
-                    expiration_date=expiry,
-                    storage_location=location,
+                    quantity=qty_needed,
+                    expiration_date=date(2027, 7, 21),   # fixed future date
+                    storage_location="SECTION A2",
                     cost_per_unit=cpu,
                     poid=poid,
                     costid=costid,
                 )
             ]
         )
-
-    # low‑level batch insert
-    def add_inventory_rows(self, rows: list[dict]):
-        tuples = [
-            (
-                r["item_id"], r["quantity"], r["expiration_date"],
-                r["storage_location"], r["cost_per_unit"], r["poid"], r["costid"]
-            )
-            for r in rows
-        ]
-        sql = ("INSERT INTO inventory "
-               "(itemid,quantity,expirationdate,storagelocation,"
-               " cost_per_unit,poid,costid) VALUES %s")
-        self._ensure_live_conn()
-        with self.conn.cursor() as cur:
-            execute_values(cur, sql, tuples)
-        self.conn.commit()
-
-    # ───────────────────── public refill API ─────────────────────
-    def restock_item(
-        self,
-        itemid: int,
-        need: int,
-        *,
-        cpu: float = 0.0,
-        note="AUTO REFILL",
-    ) -> int | None:
-        """
-        Top‑up *need* units of *itemid*; return generated POID or None.
-        If supplier missing → ValueError is raised.
-        """
-        if need <= 0:
-            return None
-
-        supplier_id = self.supplier_for_item(itemid)
-        if supplier_id is None:
-            raise ValueError("Supplier not defined for item")
-
-        poid   = self._create_po(supplier_id, note)
-        costid = self._add_cost_row(poid, itemid, cpu, need, note)
-        self._add_po_line(poid, itemid, need, cpu)
-        self._insert_inventory_layer(itemid, need, poid, costid, cpu=cpu)
-        return poid
+        self._refresh_po_cost(poid)
+        return f"OK PO#{poid}"
