@@ -1,8 +1,4 @@
-import streamlit as st
-if not st.session_state.get("sim_active", True):
-    st.stop()          # abort the page run immediately
-
-# pages/auto_POS.py
+from __future__ import annotations
 """
 Bulk POS Sale Simulation
 ────────────────────────
@@ -17,9 +13,16 @@ import pandas as pd
 import psycopg2
 import streamlit as st
 
+from utils.sim_toggle_persist import sidebar_switch   # persistent toggle
 from handler.cashier_handler import CashierHandler
 from handler.shelf_handler   import ShelfHandler
 
+# ───────── sidebar switch & guard ─────────
+if not sidebar_switch():          # adds the toggle on this page too
+    st.warning("Simulators are paused. Enable the switch to run simulations.")
+    st.stop()
+
+# ───────────────────────── connections ────────────────────────────
 cashier = CashierHandler()
 shelf   = ShelfHandler()
 
@@ -36,7 +39,6 @@ def get_item_catalogue() -> pd.DataFrame:
           AND  sellingprice > 0;
         """
     )
-
 
 def random_cart(
     cat_df: pd.DataFrame,
@@ -55,7 +57,6 @@ def random_cart(
         }
         for _, r in picks.iterrows()
     ]
-
 
 def sync_sequences() -> None:
     targets = [
@@ -130,7 +131,7 @@ def run_bulk_test() -> None:
                         msg = f"DB error: {e}"
                         break
 
-                # 💡 NEW: auto‑refill shelves after each successful sale
+                # auto‑refill shelves after each successful sale
                 if saleid:
                     shelf.post_sale_restock(cart, user="AUTOSIM")
 
@@ -146,7 +147,6 @@ def run_bulk_test() -> None:
         ok_count = sum(bool(r["sale_id"]) for r in results)
         st.success(f"Finished: **{ok_count} / {len(results)}** simulated sales succeeded.")
         st.dataframe(pd.DataFrame(results))
-
 
 # ───────────────────────── run page ──────────────────────────
 st.set_page_config(page_title="Bulk POS Simulator", page_icon="🧪")
