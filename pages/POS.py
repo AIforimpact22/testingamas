@@ -3,8 +3,7 @@ from __future__ import annotations
 POS Simulation (continuous)
 ───────────────────────────
 Live supermarket checkout with adjustable speed/load and 1‑10 cashiers.
-Runs until you hit **Stop** (or the global sidebar toggle is OFF).
-Shelves are **not** auto‑refilled here.
+Runs until you hit **Stop**.  CASH‑only; does **not** refill shelves.
 """
 
 import time
@@ -16,14 +15,10 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 
-from utils.sim_toggle_persist import sidebar_switch
-from handler.POS_handler import POSHandler
+from handler.POS_handler import POSHandler     # renamed handler
 
 # ───────────────────── page & sidebar ─────────────────────
 st.set_page_config(page_title="POS Simulation", page_icon="🛒")
-if not sidebar_switch():
-    st.warning("Simulators are paused (sidebar toggle).")
-    st.stop()
 
 st.sidebar.header("🛠 Live‑POS Controls")
 
@@ -82,6 +77,7 @@ def random_cart() -> list[dict]:
         for _, r in picks.iterrows()
     ]
 
+# Sale‑interval helpers
 def interval_standard() -> float:                 # seconds
     return 120.0
 
@@ -141,17 +137,17 @@ def process_one_sale(sim_dt: datetime):
 
 # ─────────── simulation loop ───────────
 if RUNNING:
+    # advance simulated time based on real elapsed seconds
     now_real  = time.time()
     elapsed   = now_real - st.session_state["real_ts"]
     st.session_state["sim_clock"] += timedelta(seconds=elapsed * SPEED)
     st.session_state["real_ts"]    = now_real
 
+    # generate any sales that fell within the advanced window
     while st.session_state["next_sale_sim_ts"] <= st.session_state["sim_clock"]:
         process_one_sale(st.session_state["next_sale_sim_ts"])
         gap = timedelta(seconds=next_interval(st.session_state["next_sale_sim_ts"]))
         st.session_state["next_sale_sim_ts"] += gap
-
-    st.rerun()                      # ← modern Streamlit rerun API
 
 # ─────────── live feed ───────────
 st.header("Live feed")
@@ -165,3 +161,7 @@ else:
           .reset_index(drop=True),
         use_container_width=True, height=400
     )
+
+# Auto‑refresh the page every 1 s while running
+if RUNNING and hasattr(st, "autorefresh"):
+    st.autorefresh(interval=1000, key="pos_loop_refresh")
