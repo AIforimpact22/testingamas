@@ -4,8 +4,9 @@ InventoryHandler
 Refills warehouse stock whenever an SKU’s quantity drops below
 `threshold`, topping it up to `averagerequired`.
 
-• Supplier is resolved from itemsupplier.
-• Synthetic POs are zero‑cost (simulation only).
+* Supplier is resolved from itemsupplier.
+* Synthetic POs are zero‑cost when sellingprice is 0 / NULL,
+  otherwise cost_per_unit is 75 % of sellingprice.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ DEFAULT_AVERAGE   = 100
 
 
 class InventoryHandler(DatabaseManager):
-    # ─────────────── snapshot ───────────────
+    # ───────────── snapshot ─────────────
     def stock_levels(self) -> pd.DataFrame:
         inv = self.fetch_data(
             "SELECT itemid, SUM(quantity) AS totalqty "
@@ -28,13 +29,13 @@ class InventoryHandler(DatabaseManager):
         if inv.empty:
             inv = pd.DataFrame(columns=["itemid", "totalqty"])
 
-        # 👇 use real column names: threshold, averagerequired
         meta = self.fetch_data(
             f"""
             SELECT itemid,
                    itemnameenglish,
                    COALESCE(threshold,       {DEFAULT_THRESHOLD}) AS threshold,
-                   COALESCE(averagerequired, {DEFAULT_AVERAGE})   AS averagerequired
+                   COALESCE(averagerequired, {DEFAULT_AVERAGE})   AS averagerequired,
+                   COALESCE(sellingprice ,0)                     AS sellingprice
             FROM   item
             """
         )
@@ -43,15 +44,15 @@ class InventoryHandler(DatabaseManager):
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ───────────── supplier look‑up ─────────────
+    # ─────────── supplier look‑up ───────────
     def supplier_for_item(self, itemid: int) -> int | None:
-        df = self.fetch_data(
-            "SELECT supplierid FROM itemsupplier WHERE itemid = %s LIMIT 1",
+        res = self.fetch_data(
+            "SELECT supplierid FROM itemsupplier WHERE itemid=%s LIMIT 1",
             (itemid,),
         )
-        return None if df.empty else int(df.iloc[0, 0])
+        return None if res.empty else int(res.iloc[0, 0])
 
-    # ───────────── PO helpers (unchanged) ─────────────
+    # ─────────── PO helpers ───────────
     def _create_po(self, supplier_id: int) -> int:
         poid = self.execute_command_returning(
             """
@@ -66,7 +67,7 @@ class InventoryHandler(DatabaseManager):
         )[0]
         return int(poid)
 
-    def _add_po_item(self, poid: int, itemid: int, qty: int, cpu: float = 0.0):
+    def _add_po_item(self, poid: int, itemid: int, qty: int, cpu: float):
         self.execute_command(
             "INSERT INTO purchaseorderitems "
             "(poid,itemid,orderedquantity,receivedquantity,estimatedprice) "
@@ -93,9 +94,9 @@ class InventoryHandler(DatabaseManager):
             (poid, poid),
         )
 
-    # ───────────── inventory insert ─────────────
+    # ─────────── inventory insert ───────────
     def _add_inventory_rows(self, rows: list[dict]):
-        tpl = [
+        tuples = [
             (r["item_id"], r["quantity"], r["expiration_date"],
              r["storage_location"], r["cost_per_unit"], r["poid"], r["costid"])
             for r in rows
@@ -105,20 +106,33 @@ class InventoryHandler(DatabaseManager):
                " cost_per_unit,poid,costid) VALUES %s")
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
-            execute_values(cur, sql, tpl)
+            execute_values(cur, sql, tuples)
         self.conn.commit()
 
-    # ───────────── public refill ─────────────
-    def refill(self, *, itemid: int, qty_needed: int,
-               cpu: float = 0.0) -> str:
+    # ─────────── public refill ───────────
+    def refill(self, *, itemid: int, qty_needed: int) -> str:
+        """
+        Top‑up *itemid* by *qty_needed* units.
+
+        • Calculates cost_per_unit = sellingprice × 0.75 (rounded 2 d.p.).
+        • If sellingprice is 0 / NULL ⇒ cost_per_unit = 0.
+        """
         if qty_needed <= 0:
             return "SKIP"
 
-        sup_id = self.supplier_for_item(itemid)
-        if sup_id is None:
+        supplier_id = self.supplier_for_item(itemid)
+        if supplier_id is None:
             return "NO SUPPLIER"
 
-        poid   = self._create_po(sup_id)
+        # fetch sellingprice once
+        sp_df = self.fetch_data(
+            "SELECT COALESCE(sellingprice,0) AS sp FROM item WHERE itemid=%s",
+            (itemid,),
+        )
+        selling_price = float(sp_df.iloc[0, 0]) if not sp_df.empty else 0.0
+        cpu = round(selling_price * 0.75, 2) if selling_price > 0 else 0.0
+
+        poid   = self._create_po(supplier_id)
         self._add_po_item(poid, itemid, qty_needed, cpu)
         costid = self._insert_cost(poid, itemid, cpu, qty_needed)
         self._add_inventory_rows(
@@ -126,7 +140,7 @@ class InventoryHandler(DatabaseManager):
                 dict(
                     item_id          = itemid,
                     quantity         = qty_needed,
-                    expiration_date  = date(2027, 7, 21),
+                    expiration_date  = date(2027, 7, 21),   # fixed for sim
                     storage_location = "SECTION A2",
                     cost_per_unit    = cpu,
                     poid             = poid,
