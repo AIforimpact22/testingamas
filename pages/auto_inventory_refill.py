@@ -2,27 +2,35 @@ from __future__ import annotations
 """
 Shelf Auto‑Refill (passive)
 ───────────────────────────
-Runs every 10 s, moving inventory → shelf until each SKU reaches its
-`shelfthreshold / shelfaverage`.  No UI controls; execution stops when the
-global “Simulators running” toggle (in *app.py*) is OFF.
+Runs every 10 seconds and:
+
+• Scans shelf stock.
+• Moves layers from inventory → shelf until each SKU reaches
+  `shelfthreshold` / `shelfaverage`.
+• Logs shortages when inventory cannot fully cover demand.
+
+Execution halts automatically when the global
+“Simulators running” toggle (sidebar) is OFF.
 """
 
 import streamlit as st
 import pandas as pd
 from handler.shelf_handler import ShelfHandler
+from utils.sim_toggle_persist import sidebar_switch   # ← persistent toggle
 
-# ───── stop if global toggle is OFF ─────
-if not st.session_state.get("sim_active", True):
-    st.warning("Simulators are paused (toggle in main sidebar).")
-    st.stop()
+# ────────── global switch & guard ──────────
+if not sidebar_switch():          # adds the toggle and returns its state
+    st.warning("Simulators are paused (use sidebar switch to resume).")
+    st.stop()                     # nothing else executes when paused
 
+# ─────────────────── helpers ───────────────────
 shelf = ShelfHandler()
 
 @st.cache_data(ttl=10, show_spinner=False)
 def item_meta() -> pd.DataFrame:
-    return shelf.get_all_items().set_index("itemid")   # shelfthreshold / average
+    """Threshold / average for every item (cached 10 s)."""
+    return shelf.get_all_items().set_index("itemid")
 
-# ────────────────── helpers ──────────────────
 def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
     meta = item_meta()
     kpi  = shelf.get_shelf_quantity_by_item()
@@ -41,20 +49,23 @@ def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
         return "Shortage cleared"
 
     layers = shelf.fetch_data(
-        "SELECT expirationdate, quantity, cost_per_unit "
-        "FROM inventory WHERE itemid=%s AND quantity>0 "
-        "ORDER BY expirationdate, cost_per_unit",
+        """
+        SELECT expirationdate, quantity, cost_per_unit
+        FROM   inventory
+        WHERE  itemid = %s AND quantity > 0
+        ORDER  BY expirationdate, cost_per_unit
+        """,
         (itemid,),
     )
 
     for lyr in layers.itertuples():
         take = min(need, int(lyr.quantity))
         shelf.transfer_from_inventory(
-            itemid=itemid,
-            expirationdate=lyr.expirationdate,
-            quantity=take,
-            cost_per_unit=float(lyr.cost_per_unit),
-            created_by=user,
+            itemid        = itemid,
+            expirationdate= lyr.expirationdate,
+            quantity      = take,
+            cost_per_unit = float(lyr.cost_per_unit),
+            created_by    = user,
         )
         need -= take
         if need == 0:
@@ -69,33 +80,33 @@ def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
     return f"Partial (short {need})"
 
 def auto_restock_cycle() -> pd.DataFrame:
+    """Run one scan & refill pass; return action log."""
     kpi  = shelf.get_shelf_quantity_by_item()
     meta = item_meta().reset_index()
 
-    # merge with explicit suffixes to avoid _x/_y
     df = kpi.merge(
         meta[["itemid", "shelfthreshold", "shelfaverage"]],
-        on="itemid", how="left", suffixes=("_kpi", "_meta")
+        on="itemid", how="left", suffixes=("_kpi", "_meta"),
     )
     df["threshold"] = df["shelfthreshold_meta"].fillna(df["shelfthreshold_kpi"])
     df["average"]   = df["shelfaverage_meta"].fillna(df["shelfaverage_kpi"])
 
-    below = df[df.totalquantity < df.threshold]      # ← correct column
+    below = df[df.totalquantity < df.threshold]
     actions = []
     for _, r in below.iterrows():
         status = restock_item(int(r.itemid))
         actions.append(
             dict(
-                item        = r.itemname,
-                qty_before  = int(r.totalquantity),
-                threshold   = int(r.threshold),
-                average     = int(r.average),
-                action      = status,
+                item       = r.itemname,
+                qty_before = int(r.totalquantity),
+                threshold  = int(r.threshold),
+                average    = int(r.average),
+                action     = status,
             )
         )
     return pd.DataFrame(actions)
 
-# ─────────── Streamlit page ───────────
+# ─────────────────── Streamlit page ───────────────────
 st.set_page_config("Shelf Auto‑Refill", "🗄️")
 st.title("🗄️ Shelf Auto‑Refill Monitor (passive)")
 
