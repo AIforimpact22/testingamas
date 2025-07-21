@@ -2,35 +2,32 @@ from __future__ import annotations
 """
 Shelf Auto‑Refill (passive)
 ───────────────────────────
-Every 10 s it…
+Runs every 10 seconds and moves inventory → shelf until each SKU
+reaches its `shelfthreshold / shelfaverage`.
 
-1. Scans shelf stock.
-2. If shelf quantity < `shelfthreshold`, moves layers from inventory
-   until it reaches `shelfaverage` (or at least `shelfthreshold`).
-3. Logs shortages when inventory is insufficient.
-
-Execution stops when the persistent “Simulators running” toggle (see app.py)
-is set to OFF.
+A shortage created outside a POS sale is logged with saleid = 0.
+Execution halts when the global “Simulators running” toggle is OFF.
 """
 
 import streamlit as st
 import pandas as pd
 from handler.shelf_handler import ShelfHandler
-from utils.sim_toggle_persist import sidebar_switch   # ← persistent toggle
+from utils.sim_toggle_persist import sidebar_switch   # persistent toggle
 
-# ───────── sidebar switch & guard ─────────
-if not sidebar_switch():          # adds the toggle, returns its state
-    st.warning("Simulators are paused (toggle in main sidebar).")
+# ─────── global switch & guard ───────
+if not sidebar_switch():
+    st.warning("Simulators are paused (use sidebar switch to resume).")
     st.stop()
 
-# ─────────────────── helpers ────────────────────
+DUMMY_SALEID = 0          # used for system‑generated shortages
+
 shelf = ShelfHandler()
 
 @st.cache_data(ttl=10, show_spinner=False)
 def item_meta() -> pd.DataFrame:
-    """Return threshold / average per itemid (cached 10 s)."""
     return shelf.get_all_items().set_index("itemid")
 
+# ────────────────── helpers ──────────────────
 def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
     meta = item_meta()
     kpi  = shelf.get_shelf_quantity_by_item()
@@ -61,32 +58,34 @@ def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
     for lyr in layers.itertuples():
         take = min(need, int(lyr.quantity))
         shelf.transfer_from_inventory(
-            itemid=itemid,
-            expirationdate=lyr.expirationdate,
-            quantity=take,
-            cost_per_unit=float(lyr.cost_per_unit),
-            created_by=user,
+            itemid        = itemid,
+            expirationdate= lyr.expirationdate,
+            quantity      = take,
+            cost_per_unit = float(lyr.cost_per_unit),
+            created_by    = user,
         )
         need -= take
         if need == 0:
             return "Refilled"
 
-    # not enough inventory → log shortage
+    # still short → log shortage with dummy saleid
     shelf.execute_command(
-        "INSERT INTO shelf_shortage (itemid, shortage_qty, logged_at) "
-        "VALUES (%s, %s, CURRENT_TIMESTAMP)",
-        (itemid, need),
+        """
+        INSERT INTO shelf_shortage
+              (saleid, itemid, shortage_qty, logged_at)
+        VALUES (%s,     %s,     %s,           CURRENT_TIMESTAMP)
+        """,
+        (DUMMY_SALEID, itemid, need),
     )
     return f"Partial (short {need})"
 
 def auto_restock_cycle() -> pd.DataFrame:
-    """Run one scan‑and‑refill pass; return action log."""
     kpi  = shelf.get_shelf_quantity_by_item()
     meta = item_meta().reset_index()
 
     df = kpi.merge(
         meta[["itemid", "shelfthreshold", "shelfaverage"]],
-        on="itemid", how="left", suffixes=("_kpi", "_meta")
+        on="itemid", how="left", suffixes=("_kpi", "_meta"),
     )
     df["threshold"] = df["shelfthreshold_meta"].fillna(df["shelfthreshold_kpi"])
     df["average"]   = df["shelfaverage_meta"].fillna(df["shelfaverage_kpi"])
@@ -106,7 +105,7 @@ def auto_restock_cycle() -> pd.DataFrame:
         )
     return pd.DataFrame(actions)
 
-# ─────────────────── Streamlit page ───────────────────
+# ─────────── Streamlit page ───────────
 st.set_page_config("Shelf Auto‑Refill", "🗄️")
 st.title("🗄️ Shelf Auto‑Refill Monitor (passive)")
 
@@ -117,6 +116,5 @@ else:
     st.success(f"{len(log_df)} SKU(s) processed this cycle.")
     st.dataframe(log_df, use_container_width=True)
 
-# auto‑refresh every 10 s
 if hasattr(st, "autorefresh"):
     st.autorefresh(interval=10000, key="shelf_refill_refresh")
