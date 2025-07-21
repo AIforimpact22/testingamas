@@ -1,3 +1,7 @@
+import streamlit as st
+if not st.session_state.get("sim_active", True):
+    st.stop()          # abort the page run immediately
+  
 from __future__ import annotations
 """
 Auto‑Inventory Refill Monitor
