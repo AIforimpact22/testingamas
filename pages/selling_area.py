@@ -1,51 +1,58 @@
 from __future__ import annotations
 """
 Selling‑Area Auto‑Refill
-────────────────────────
-Press ▶ **Start** to begin; the checker runs forever at the chosen
-interval until you press ⏹ **Stop**.
+────────────────────────────────────────────
+Press **Start** to begin; the checker runs forever
+at the chosen interval until you press **Stop**.
 
-• Uses item‑to‑slot mapping in **item_slot**.
-• Moves real inventory layers (keeps expiration dates & cost).
-• Logs shortages with `saleid = 0` if warehouse empty.
+Logic
+• Every cycle: compare each SKU’s shelf qty vs. `shelfthreshold`
+  (fallback 0) from the *item* table.
+• If below threshold → move oldest inventory layers → shelf
+  up to `shelfaverage` (fallback = threshold) while resolving
+  open shortages.
+• New shortages created here use `saleid = 0`.
+• Shelf locations are read from **item_slot(itemid,locid)**.
 """
 
 import time
 from datetime import datetime
 import streamlit as st
 import pandas as pd
+
 from handler.selling_area_handler import SellingAreaHandler
 
-# ───────────────────── page config ─────────────────────
-st.set_page_config(page_title="Selling‑Area Auto‑Refill", page_icon="🗄️")
-st.title("🗄️ Selling‑Area Auto‑Refill")
+# ─────────── page config ───────────
+st.set_page_config(page_title="Shelf Auto‑Refill", page_icon="🗄️")
+st.title("🗄️ Shelf Auto‑Refill")
 
-# ───────────────────── interval picker ─────────────────────
-st.sidebar.header("Refill interval")
+# ─────────── sidebar interval ───────────
+st.sidebar.header("Check every …")
 UNIT  = st.sidebar.selectbox("Unit", ("Seconds", "Minutes", "Hours", "Days"))
-VALUE = st.sidebar.number_input("Every …", min_value=1, step=1, value=10)
+VALUE = st.sidebar.number_input("Interval", min_value=1, step=1, value=10)
 
-mult          = {"Seconds": 1, "Minutes": 60, "Hours": 3600, "Days": 86_400}[UNIT]
-INTERVAL_SEC  = VALUE * mult
+mult = {"Seconds": 1, "Minutes": 60, "Hours": 3600, "Days": 86_400}[UNIT]
+INTERVAL_SEC = VALUE * mult
 
-# ───────────────────── Start / Stop ─────────────────────
+# ─────────── start / stop buttons ───────────
 RUNNING = st.session_state.get("shelf_running", False)
-col_run, col_stop = st.columns(2)
-if col_run.button("▶ Start", disabled=RUNNING):
+col_start, col_stop = st.columns(2)
+if col_start.button("▶ Start", disabled=RUNNING):
     st.session_state.update(
         shelf_running=True,
-        last_check_ts=0.0,
+        last_check_ts=time.time() - INTERVAL_SEC,  # run immediately
         cycle_count=0,
         last_result=[],
     )
     RUNNING = True
+
 if col_stop.button("⏹ Stop", disabled=not RUNNING):
     st.session_state["shelf_running"] = False
     RUNNING = False
 
-# ───────────────────── data helpers ─────────────────────
+# ─────────── helpers ───────────
 shelf = SellingAreaHandler()
-DUMMY_SALEID = 0   # saleid = 0 for system shortages
+DUMMY_SALEID = 0
 
 @st.cache_data(ttl=300, show_spinner=False)
 def item_meta() -> pd.DataFrame:
@@ -76,25 +83,20 @@ def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
         """,
         (itemid,),
     )
-
     for lyr in layers.itertuples():
         take = min(need, int(lyr.quantity))
-        try:
-            shelf.transfer_from_inventory(
-                itemid=itemid,
-                expirationdate=lyr.expirationdate,
-                quantity=take,
-                cost_per_unit=float(lyr.cost_per_unit),
-                created_by=user,
-                locid=None,          # auto‑resolved inside handler
-            )
-            need -= take
-            if need == 0:
-                return "Refilled"
-        except ValueError as e:
-            return str(e)            # missing slot mapping
+        shelf.transfer_from_inventory(
+            itemid=itemid,
+            expirationdate=lyr.expirationdate,
+            quantity=take,
+            cost_per_unit=float(lyr.cost_per_unit),
+            created_by=user,
+        )
+        need -= take
+        if need == 0:
+            return "Refilled"
 
-    # warehouse empty → log shortage
+    # not enough inventory → shortage row (saleid = 0)
     shelf.execute_command(
         """
         INSERT INTO shelf_shortage
@@ -106,15 +108,19 @@ def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
     return f"Partial (short {need})"
 
 def run_cycle() -> list[dict]:
+    """One full pass – returns list of action dicts for UI."""
     kpi  = shelf.get_shelf_quantity_by_item()
     meta = item_meta().reset_index()
 
     df = kpi.merge(
         meta[["itemid", "shelfthreshold", "shelfaverage"]],
-        on="itemid", how="left", suffixes=("", "_meta"),
+        on="itemid",
+        how="left",
+        suffixes=("", "_meta"),
     )
-    df["shelfthreshold"].fillna(df["shelfthreshold_meta"], inplace=True)
-    df["shelfaverage"].fillna(df["shelfaverage_meta"], inplace=True)
+    # pandas 2.x – avoid chained‑assignment warning
+    df["shelfthreshold"] = df["shelfthreshold"].fillna(df["shelfthreshold_meta"])
+    df["shelfaverage"]   = df["shelfaverage"].fillna(df["shelfaverage_meta"])
 
     below = df[df.totalquantity < df.shelfthreshold]
     actions: list[dict] = []
@@ -123,7 +129,7 @@ def run_cycle() -> list[dict]:
         actions.append({"item": r.itemname, "action": status})
     return actions
 
-# ───────────────────── main loop ─────────────────────
+# ─────────── main loop ───────────
 if RUNNING:
     now = time.time()
     if now - st.session_state["last_check_ts"] >= INTERVAL_SEC:
@@ -134,11 +140,12 @@ if RUNNING:
     st.metric("Cycles run", st.session_state["cycle_count"])
     st.metric(
         "Last cycle",
-        datetime.fromtimestamp(st.session_state["last_check_ts"])
-        .strftime("%F %T"),
+        datetime.fromtimestamp(st.session_state["last_check_ts"]).strftime("%F %T"),
     )
-    st.metric("SKUs processed", len(st.session_state["last_result"]))
+    st.metric("SKUs processed last cycle", len(st.session_state["last_result"]))
+
+    # small sleep to yield control, then immediate self‑rerun
     time.sleep(0.2)
     st.rerun()
 else:
-    st.info("Press ▶ **Start** to begin automatic shelf top‑ups.")
+    st.info("Press **Start** to begin automatic shelf top‑ups.")
