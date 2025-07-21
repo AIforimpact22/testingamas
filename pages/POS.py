@@ -2,9 +2,9 @@ from __future__ import annotations
 """
 POS Simulation (continuous)
 ───────────────────────────
-• Live supermarket checkout with adjustable speed/load and 1‑10 cashiers.
-• Runs until you hit **Stop** (or the global sidebar toggle is OFF).
-• CASH‑only; shelf refills handled by the Shelf page.
+Live supermarket checkout with adjustable speed/load and 1‑10 cashiers.
+Runs until you hit **Stop** (or the global sidebar toggle is OFF).
+Shelves are **not** auto‑refilled here.
 """
 
 import time
@@ -16,8 +16,8 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 
-from utils.sim_toggle_persist import sidebar_switch          # global toggle
-from handler.POS_handler import POSHandler                   # ← new import
+from utils.sim_toggle_persist import sidebar_switch
+from handler.POS_handler import POSHandler
 
 # ───────────────────── page & sidebar ─────────────────────
 st.set_page_config(page_title="POS Simulation", page_icon="🛒")
@@ -34,21 +34,23 @@ LOAD_MODE  = st.sidebar.selectbox(
 )
 CASHIERS   = st.sidebar.slider("Active cashiers", 1, 10, 3)
 
-# Mix options
+# Item‑mix parameters
 min_items  = st.sidebar.number_input("Min items / sale", 1, 20, 2)
 max_items  = st.sidebar.number_input("Max items / sale", min_items, 30, 6)
 min_qty    = st.sidebar.number_input("Min qty / item", 1, 20, 1)
 max_qty    = st.sidebar.number_input("Max qty / item", min_qty, 50, 5)
 
-# Start / stop buttons
+# ───── Start / Stop buttons ─────
 RUNNING = st.session_state.get("pos_running", False)
 col_run, col_stop = st.columns(2)
 if col_run.button("▶ Start" if not RUNNING else "⏸ Resume", disabled=RUNNING):
-    st.session_state["pos_running"] = True
-    st.session_state["sim_clock"]   = datetime.now()
-    st.session_state["real_ts"]     = time.time()
-    st.session_state["next_sale_sim_ts"] = st.session_state["sim_clock"]
-    st.session_state["sales_log"]   = []
+    st.session_state.update(
+        pos_running=True,
+        sim_clock=datetime.now(),
+        real_ts=time.time(),
+        next_sale_sim_ts=datetime.now(),
+        sales_log=[],
+    )
     RUNNING = True
 
 if col_stop.button("⏹ Stop", disabled=not RUNNING):
@@ -80,8 +82,8 @@ def random_cart() -> list[dict]:
         for _, r in picks.iterrows()
     ]
 
-def interval_standard() -> float:
-    return 120.0                       # seconds
+def interval_standard() -> float:                 # seconds
+    return 120.0
 
 def interval_real_time(sim_dt: datetime) -> float:
     h = sim_dt.hour
@@ -127,12 +129,10 @@ def process_one_sale(sim_dt: datetime):
     except psycopg2.errors.UniqueViolation:
         cashier.conn.rollback()
         sync_sequences()
-        status = "Retry fail"
-        saleid = None
+        status, saleid = "Retry fail", None
     except Exception as e:
         cashier.conn.rollback()
-        status = f"Error: {e}"
-        saleid = None
+        status, saleid = f"Error: {e}", None
 
     st.session_state["sales_log"].append(
         dict(ts=sim_dt, saleid=saleid, cashier=cashier_id,
@@ -151,7 +151,7 @@ if RUNNING:
         gap = timedelta(seconds=next_interval(st.session_state["next_sale_sim_ts"]))
         st.session_state["next_sale_sim_ts"] += gap
 
-    st.experimental_rerun()
+    st.rerun()                      # ← modern Streamlit rerun API
 
 # ─────────── live feed ───────────
 st.header("Live feed")
