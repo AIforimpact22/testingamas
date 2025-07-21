@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 import streamlit as st
 import pandas as pd
-from handler.selling_area_handler import SellingAreaHandler   # ← fixed import
+from handler.selling_area_handler import SellingAreaHandler   # ← uses new name
 
 # ───────────── page config ─────────────
 st.set_page_config(page_title="Shelf Auto‑Refill", page_icon="🗄️")
@@ -76,6 +76,7 @@ def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
             quantity=take,
             cost_per_unit=float(lyr.cost_per_unit),
             created_by=user,
+            locid="AUTO",              # ← includes locid to match unique key
         )
         need -= take
         if need == 0:
@@ -95,8 +96,6 @@ def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
 def run_cycle() -> list[dict]:
     kpi  = shelf.get_shelf_quantity_by_item()
     meta = item_meta().reset_index()
-
-    # explicit suffixes so 'shelfthreshold' exists
     df = kpi.merge(
         meta[["itemid", "shelfthreshold", "shelfaverage"]],
         on="itemid",
