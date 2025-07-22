@@ -1,23 +1,21 @@
 """
-SellingAreaHandler  – bulk mode
-───────────────────────────────
-• Moves stock *in bulk* from **inventory** → **shelf**  
-  (one transaction per cycle; no per‑row commits)
-• 1 row per (itemid, expiry, cpu, locid) kept unique in **shelf**  
-• Every movement is logged in **shelfentries**
+SellingAreaHandler – bulk mode
+──────────────────────────────
+• Moves stock from **inventory** → **shelf** in one transaction.
+• Keeps (itemid, expiry, cpu, locid) unique in *shelf*.
+• Logs every movement in *shelfentries*.
 """
 
 from __future__ import annotations
 import pandas as pd
 from psycopg2.extras import execute_values
-
 from db_handler import DatabaseManager
 
-DEFAULT_LOCID = "UNASSIGNED"      # fallback when item_slot is missing
+DEFAULT_LOCID = "UNASSIGNED"          # fallback when item_slot is missing
 
 
 class SellingAreaHandler(DatabaseManager):
-    # ──────────────────── KPI snapshot ────────────────────
+    # ───────────────────── KPI snapshot ─────────────────────
     def shelf_kpis(self) -> pd.DataFrame:
         return self.fetch_data(
             """
@@ -33,7 +31,7 @@ class SellingAreaHandler(DatabaseManager):
             """
         )
 
-    # ─────────────────── location helper ───────────────────
+    # ───────────────────── loc‑lookup ─────────────────────
     def loc_for_item(self, itemid: int) -> str:
         res = self.fetch_data(
             "SELECT locid FROM item_slot WHERE itemid = %s LIMIT 1",
@@ -41,35 +39,33 @@ class SellingAreaHandler(DatabaseManager):
         )
         return DEFAULT_LOCID if res.empty else res.iloc[0, 0]
 
-    # ─────────────────── bulk refill API ───────────────────
+    # ───────────────────── bulk refill ─────────────────────
     def restock_items_bulk(self, df_need: pd.DataFrame) -> list[dict]:
         """
-        Expects columns:  itemid · need
-        Returns one compact log dict per layer moved.
+        df_need columns →  itemid • need
+        Returns UI‑log list[dict].
         """
         if df_need.empty:
             return []
 
-        # 1️⃣ Build a work‑list of inventory layers to pull
-        inv_layers: list[dict] = []
-        for _, r in df_need.iterrows():
-            iid, need = int(r.itemid), int(r.need)
+        # 1️⃣ build work‑list of inv layers to pull
+        layers: list[dict] = []
+        for _, row in df_need.iterrows():
+            iid, need = int(row.itemid), int(row.need)
             if need <= 0:
                 continue
-
-            layers = self.fetch_data(
+            inv = self.fetch_data(
                 """
                 SELECT expirationdate, quantity, cost_per_unit
                 FROM   inventory
-                WHERE  itemid = %s AND quantity > 0
+                WHERE  itemid=%s AND quantity>0
                 ORDER  BY expirationdate, cost_per_unit
                 """,
                 (iid,),
             )
-
-            for lyr in layers.itertuples():
+            for lyr in inv.itertuples():
                 take = min(need, int(lyr.quantity))
-                inv_layers.append(
+                layers.append(
                     dict(itemid=iid,
                          exp=lyr.expirationdate,
                          take=take,
@@ -80,13 +76,13 @@ class SellingAreaHandler(DatabaseManager):
                 if need == 0:
                     break
 
-        if not inv_layers:
-            return []                       # nothing to move
+        if not layers:
+            return []
 
-        # 2️⃣ ONE atomic transaction
+        # 2️⃣ one atomic tx: update inventory, upsert shelf, insert shelfentries
         with self.conn:
             with self.conn.cursor() as cur:
-                # a) decrement inventory layers
+                # inventory −qty
                 execute_values(
                     cur,
                     """
@@ -97,11 +93,10 @@ class SellingAreaHandler(DatabaseManager):
                       AND inv.expirationdate = v.exp
                       AND inv.cost_per_unit  = v.cpu
                     """,
-                    [(l["itemid"], l["exp"], l["cpu"], l["take"])
-                     for l in inv_layers],
+                    [(l["itemid"], l["exp"], l["cpu"], l["take"]) for l in layers],
                 )
 
-                # b) upsert into shelf
+                # shelf +qty (upsert)
                 execute_values(
                     cur,
                     """
@@ -109,18 +104,15 @@ class SellingAreaHandler(DatabaseManager):
                           (itemid, expirationdate, quantity,
                            cost_per_unit, locid)
                     VALUES %s
-                    ON CONFLICT (itemid, expirationdate,
-                                 cost_per_unit, locid)
-                    DO UPDATE SET quantity    = shelf.quantity
-                                               + EXCLUDED.quantity,
+                    ON CONFLICT (itemid,expirationdate,cost_per_unit,locid)
+                    DO UPDATE SET quantity    = shelf.quantity + EXCLUDED.quantity,
                                   lastupdated = CURRENT_TIMESTAMP
                     """,
-                    [(l["itemid"], l["exp"], l["take"],
-                      l["cpu"], l["loc"])
-                     for l in inv_layers],
+                    [(l["itemid"], l["exp"], l["take"], l["cpu"], l["loc"])
+                     for l in layers],
                 )
 
-                # c) **new** – log every move in shelfentries
+                # shelfentries log
                 execute_values(
                     cur,
                     """
@@ -129,14 +121,12 @@ class SellingAreaHandler(DatabaseManager):
                     VALUES %s
                     """,
                     [(l["itemid"], l["exp"], l["take"], "AUTO‑SHELF")
-                     for l in inv_layers],
+                     for l in layers],
                 )
 
-        # 3️⃣ compact UI log
+        # 3️⃣ compact return log
         return [
-            dict(itemid=l["itemid"],
-                 added=l["take"],
-                 locid=l["loc"],
-                 exp=l["exp"])
-            for l in inv_layers
+            dict(itemid=l["itemid"], added=l["take"],
+                 locid=l["loc"], exp=l["exp"])
+            for l in layers
         ]
