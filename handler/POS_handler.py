@@ -24,6 +24,7 @@ from psycopg2.extras import execute_values
 
 from db_handler import DatabaseManager
 
+
 # --------------------------------------------------------------------------- #
 #                               Main handler class                            #
 # --------------------------------------------------------------------------- #
@@ -66,6 +67,8 @@ class POSHandler(DatabaseManager):
 
     # ───────────────────── line‑items (batch insert) ────────────────────
     def add_sale_items(self, saleid: int, items: List[Dict[str, Any]]) -> None:
+        if not items:
+            return
         rows = [
             (
                 saleid,
@@ -75,7 +78,11 @@ class POSHandler(DatabaseManager):
                 float(it["totalprice"]),
             )
             for it in items
+            if it["quantity"] > 0          # skip zero‑sold rows
         ]
+        if not rows:
+            return
+
         sql = """
             INSERT INTO salesitems
                   (saleid, itemid, quantity, unitprice, totalprice)
@@ -162,11 +169,12 @@ class POSHandler(DatabaseManager):
 
         for it in cart_items:
             iid  = int(it["itemid"])
-            qty  = int(it["quantity"])
-            price= float(it["sellingprice"])
+            req_qty = int(it["quantity"])
+            price   = float(it["sellingprice"])
 
-            running_total += qty * price
-            shortage_qty   = self._deduct_from_shelf(iid, qty)
+            shortage_qty = self._deduct_from_shelf(iid, req_qty)
+            sold_qty     = req_qty - shortage_qty
+            running_total += sold_qty * price
 
             if shortage_qty > 0:
                 # 1) log shortage row
@@ -182,17 +190,18 @@ class POSHandler(DatabaseManager):
                 ).iat[0, 0]
                 shortages.append({"itemname": name, "qty": shortage_qty})
 
-            # 2) prepare salesitems row
-            lines.append(
-                dict(
-                    itemid     = iid,
-                    quantity   = qty,
-                    unitprice  = price,
-                    totalprice = round(qty * price, 2),
+            # 2) prepare salesitems row (only if something was sold)
+            if sold_qty > 0:
+                lines.append(
+                    dict(
+                        itemid     = iid,
+                        quantity   = sold_qty,
+                        unitprice  = price,
+                        totalprice = round(sold_qty * price, 2),
+                    )
                 )
-            )
 
-        # batch insert items
+        # batch insert items (may be empty if everything was out of stock)
         self.add_sale_items(saleid, lines)
 
         # update header totals
