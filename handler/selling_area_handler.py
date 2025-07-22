@@ -7,16 +7,22 @@ SellingAreaHandler – bulk mode
 """
 
 from __future__ import annotations
+from collections import defaultdict
+from typing import List, Dict
+
 import pandas as pd
 from psycopg2.extras import execute_values
+
 from db_handler import DatabaseManager
 
 DEFAULT_LOCID = "UNASSIGNED"          # fallback when item_slot is missing
+_CREATED_BY   = "AUTO‑SHELF"          # single source of truth
 
 
 class SellingAreaHandler(DatabaseManager):
     # ───────────────────── KPI snapshot ─────────────────────
     def shelf_kpis(self) -> pd.DataFrame:
+        """Current qty on shelf per SKU (all locations combined)."""
         return self.fetch_data(
             """
             SELECT i.itemid,
@@ -40,20 +46,28 @@ class SellingAreaHandler(DatabaseManager):
         return DEFAULT_LOCID if res.empty else res.iloc[0, 0]
 
     # ───────────────────── bulk refill ─────────────────────
-    def restock_items_bulk(self, df_need: pd.DataFrame) -> list[dict]:
+    def restock_items_bulk(self, df_need: pd.DataFrame) -> List[Dict]:
         """
-        df_need columns →  itemid • need
-        Returns UI‑log list[dict].
+        Parameters
+        ----------
+        df_need
+            Columns →  itemid • need  (positive integers)
+
+        Returns
+        -------
+        list[dict]
+            UI‑friendly summary  {itemid, added, locid, exp}
         """
         if df_need.empty:
             return []
 
-        # 1️⃣ build work‑list of inv layers to pull
+        # 1️⃣ build work‑list of inventory layers we will pull from
         layers: list[dict] = []
         for _, row in df_need.iterrows():
             iid, need = int(row.itemid), int(row.need)
             if need <= 0:
                 continue
+
             inv = self.fetch_data(
                 """
                 SELECT expirationdate, quantity, cost_per_unit
@@ -63,26 +77,38 @@ class SellingAreaHandler(DatabaseManager):
                 """,
                 (iid,),
             )
+
             for lyr in inv.itertuples():
-                take = min(need, int(lyr.quantity))
+                take_qty = min(need, int(lyr.quantity))
                 layers.append(
                     dict(itemid=iid,
                          exp=lyr.expirationdate,
-                         take=take,
+                         take=take_qty,
                          cpu=float(lyr.cost_per_unit),
                          loc=self.loc_for_item(iid))
                 )
-                need -= take
+                need -= take_qty
                 if need == 0:
                     break
 
         if not layers:
             return []
 
-        # 2️⃣ one atomic tx: update inventory, upsert shelf, insert shelfentries
+        # 2️⃣ combine duplicates to avoid multi‑row ON CONFLICT collisions
+        merged: dict[tuple, int] = defaultdict(int)
+        for l in layers:
+            key = (l["itemid"], l["exp"], l["cpu"], l["loc"])
+            merged[key] += l["take"]
+
+        compact_layers = [
+            dict(itemid=k[0], exp=k[1], cpu=k[2], loc=k[3], take=v)
+            for k, v in merged.items()
+        ]
+
+        # 3️⃣ one atomic tx: inventory −qty → shelf +qty → shelfentries log
         with self.conn:
             with self.conn.cursor() as cur:
-                # inventory −qty
+                # 3a. inventory −qty
                 execute_values(
                     cur,
                     """
@@ -93,10 +119,14 @@ class SellingAreaHandler(DatabaseManager):
                       AND inv.expirationdate = v.exp
                       AND inv.cost_per_unit  = v.cpu
                     """,
-                    [(l["itemid"], l["exp"], l["cpu"], l["take"]) for l in layers],
+                    [(l["itemid"], l["exp"], l["cpu"], l["take"])
+                     for l in compact_layers],
                 )
 
-                # shelf +qty (upsert)
+                # 3b. remove empty inventory rows (tidy but optional)
+                cur.execute("DELETE FROM inventory WHERE quantity <= 0")
+
+                # 3c. shelf +qty (UPSERT)
                 execute_values(
                     cur,
                     """
@@ -109,10 +139,10 @@ class SellingAreaHandler(DatabaseManager):
                                   lastupdated = CURRENT_TIMESTAMP
                     """,
                     [(l["itemid"], l["exp"], l["take"], l["cpu"], l["loc"])
-                     for l in layers],
+                     for l in compact_layers],
                 )
 
-                # shelfentries log
+                # 3d. shelfentries log
                 execute_values(
                     cur,
                     """
@@ -120,13 +150,13 @@ class SellingAreaHandler(DatabaseManager):
                           (itemid, expirationdate, quantity, createdby)
                     VALUES %s
                     """,
-                    [(l["itemid"], l["exp"], l["take"], "AUTO‑SHELF")
-                     for l in layers],
+                    [(l["itemid"], l["exp"], l["take"], _CREATED_BY)
+                     for l in compact_layers],
                 )
 
-        # 3️⃣ compact return log
+        # 4️⃣ compact return‑value for the UI
         return [
             dict(itemid=l["itemid"], added=l["take"],
                  locid=l["loc"], exp=l["exp"])
-            for l in layers
+            for l in compact_layers
         ]
