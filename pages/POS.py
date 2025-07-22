@@ -53,6 +53,22 @@ if st.button("⏹ Stop", disabled=not RUNNING):
 
 # ───────────── helpers ─────────────
 cashier = POSHandler()
+cashier.execute_command("SELECT 1")            # ensure connection
+
+def _sync_sequences_once() -> None:
+    """Bring Postgres sequences in line with current max(pk)."""
+    for tbl, pk in (("sales", "saleid"), ("salesitems", "salesitemid")):
+        cashier.execute_command(
+            f"""
+            SELECT setval(
+                pg_get_serial_sequence('{tbl}','{pk}'),
+                COALESCE((SELECT MAX({pk}) FROM {tbl}), 0) + 1,
+                false
+            )
+            """
+        )
+
+_sync_sequences_once()
 
 @st.cache_data(ttl=600, show_spinner=False)
 def item_catalogue() -> pd.DataFrame:
@@ -67,7 +83,16 @@ def item_catalogue() -> pd.DataFrame:
 CATALOGUE = item_catalogue()
 
 def random_cart() -> list[dict]:
-    n_items = random.randint(min_items, min(max_items, len(CATALOGUE)))
+    """Return a random basket respecting sidebar constraints
+    and current catalogue size."""
+    available = len(CATALOGUE)
+    if available == 0:
+        return []
+
+    low  = min(min_items, available)
+    high = min(max_items, available)
+    n_items = random.randint(low, high)
+
     picks   = CATALOGUE.sample(n=n_items, replace=False)
     return [
         dict(itemid=int(r.itemid),
@@ -83,17 +108,18 @@ def base_interval(sim_dt: datetime) -> float:            # seconds
     if 6 <= h < 10:
         return 180
     if 10 <= h < 14:
-        return 90
+        return  90
     if 14 <= h < 18:
-        return 60
+        return  60
     if 18 <= h < 22:
-        return 40
+        return  40
     return 240
 
 def next_interval(sim_dt: datetime) -> float:
     return base_interval(sim_dt) / SPEED
 
 def sync_sequences() -> None:
+    """Re‑sync sequences after a UniqueViolation, then continue."""
     for tbl, pk in (("sales", "saleid"), ("salesitems", "salesitemid")):
         cashier.execute_command(
             f"""
@@ -105,21 +131,31 @@ def sync_sequences() -> None:
 
 def process_one_sale(sim_dt: datetime):
     cart        = random_cart()
+    if not cart:                     # catalogue might be empty
+        return
     cashier_id  = f"CASH{random.randint(1, CASHIERS):02d}"
-    try:
-        cashier.process_sale_with_shortage(
-            cart_items     = cart,
-            discount_rate  = 0.0,
-            payment_method = "Cash",
-            cashier        = cashier_id,
-            notes          = f"[SIM {sim_dt:%F %T}]",
-        )
-    except psycopg2.errors.UniqueViolation:
-        cashier.conn.rollback()
-        sync_sequences()
-    except Exception:
-        cashier.conn.rollback()
-    st.session_state["sales_count"] += 1
+
+    success = False
+    for attempt in range(2):         # at most one retry
+        try:
+            saleid, _ = cashier.process_sale_with_shortage(
+                cart_items     = cart,
+                discount_rate  = 0.0,
+                payment_method = "Cash",
+                cashier        = cashier_id,
+                notes          = f"[SIM {sim_dt:%F %T}]",
+            )
+            success = saleid is not None
+            break
+        except psycopg2.errors.UniqueViolation:
+            cashier.conn.rollback()
+            sync_sequences()         # repair sequences, then retry once
+        except Exception:
+            cashier.conn.rollback()
+            break
+
+    if success:
+        st.session_state["sales_count"] += 1
 
 # ───────────── simulation loop ─────────────
 if RUNNING:
