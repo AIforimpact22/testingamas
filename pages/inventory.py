@@ -1,3 +1,4 @@
+# pages/inventory.py
 """
 📦 Inventory Auto‑Refill
 ────────────────────────
@@ -18,14 +19,25 @@ from handler.inventory_handler import InventoryHandler
 st.set_page_config(page_title="Inventory Auto‑Refill", page_icon="📦")
 st.title("📦 Inventory Auto‑Refill")
 
-# ───────── sidebar interval ─────────
+# ────────────────── sidebar interval ──────────────────
 unit  = st.sidebar.selectbox("Interval unit", ("Seconds", "Minutes", "Hours"))
 value = st.sidebar.number_input("Every …", 1, step=1, value=30)
 INTERVAL = value * {"Seconds": 1, "Minutes": 60, "Hours": 3600}[unit]
 
-# ───────── start / stop ─────────
-RUN = st.session_state.get("inv_run", False)
+# ────────────────── session‑state seeds ──────────────────
+# (run once per browser session; avoids KeyError on reload)
+for k, v in {
+    "inv_run":   False,
+    "last_ts":   0.0,
+    "cycles":    0,
+    "last_log":  [],
+}.items():
+    st.session_state.setdefault(k, v)
+
+# ────────────────── start / stop ──────────────────
+RUN = st.session_state["inv_run"]
 c1, c2 = st.columns(2)
+
 if c1.button("▶ Start", disabled=RUN):
     st.session_state.update(inv_run=True,
                             last_ts=0.0,
@@ -51,7 +63,7 @@ def one_cycle() -> list[dict]:
     below["need"] = below["average"] - below["totalqty"]
     return inv.restock_items_bulk(below[["itemid", "need", "sellingprice"]])
 
-# ───────── loop ─────────
+# ────────────────── main loop ──────────────────
 if RUN:
     now = time.time()
     if now - st.session_state["last_ts"] >= INTERVAL:
@@ -63,6 +75,8 @@ if RUN:
     st.metric("Rows added",    len(st.session_state["last_log"]))
     st.metric("Last run",
               datetime.fromtimestamp(st.session_state["last_ts"]).strftime("%F %T"))
+
+    # gentle yield so the UI can refresh smoothly
     time.sleep(0.3)
     st.rerun()
 else:
