@@ -1,171 +1,121 @@
 """
-SellingAreaHandler  –  full version
-===================================
-•  Keeps resolve_shortages() and restock_item() from earlier drafts.
-•  Upsert key on shelf = (itemid, expirationdate, locid, cost_per_unit).
+SellingAreaHandler  (fast bulk mode)
+────────────────────────────────────
+• Pulls needed layers from *inventory* → *shelf* **in bulk**  
+  (one SQL transaction per cycle — no per‑row commits).  
+• 1 row per (itemid, expiry, cpu, locid) is kept unique in *shelf*.
 """
 
 from __future__ import annotations
-from datetime import date
 import pandas as pd
 from psycopg2.extras import execute_values
 from db_handler import DatabaseManager
 
-__all__ = ["SellingAreaHandler"]
+# fallback location when an item is missing in item_slot
+DEFAULT_LOCID = "UNASSIGNED"
 
 
 class SellingAreaHandler(DatabaseManager):
-    # ───────────────────── private helpers ─────────────────────
-    def _lookup_locid(self, itemid: int) -> str | None:
-        df = self.fetch_data(
-            "SELECT locid FROM item_slot WHERE itemid = %s LIMIT 1", (itemid,)
-        )
-        return None if df.empty else df.iloc[0, 0]
-
-    def _upsert_shelf_layer(
-        self,
-        *,
-        cur,
-        itemid: int,
-        expirationdate,
-        quantity: int,
-        cost_per_unit: float,
-        locid: str,
-        created_by: str,
-    ) -> None:
-        cur.execute(
-            """
-            INSERT INTO shelf
-                  (itemid, expirationdate, quantity, cost_per_unit, locid)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (itemid, expirationdate, locid, cost_per_unit)
-            DO UPDATE SET quantity    = shelf.quantity + EXCLUDED.quantity,
-                          lastupdated = CURRENT_TIMESTAMP;
-            """,
-            (itemid, expirationdate, quantity, cost_per_unit, locid),
-        )
-        cur.execute(
-            """
-            INSERT INTO shelfentries
-                  (itemid, expirationdate, quantity, createdby, locid)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (itemid, expirationdate, quantity, created_by, locid),
-        )
-
-    # ───────────────────── inventory → shelf ─────────────────────
-    def transfer_from_inventory(
-        self,
-        *,
-        itemid: int,
-        expirationdate,
-        quantity: int,
-        cost_per_unit: float,
-        created_by: str,
-        locid: str | None = None,
-    ) -> None:
-        if locid is None:
-            locid = self._lookup_locid(itemid)
-            if locid is None:
-                raise ValueError(f"No slot mapping for item {itemid}")
-
-        self._ensure_live_conn()
-        with self.conn:
-            with self.conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE inventory
-                       SET quantity = quantity - %s
-                     WHERE itemid = %s
-                       AND expirationdate = %s
-                       AND cost_per_unit  = %s
-                       AND quantity      >= %s
-                    """,
-                    (quantity, itemid, expirationdate, cost_per_unit, quantity),
-                )
-                if cur.rowcount == 0:
-                    raise ValueError("Insufficient inventory layer")
-
-                self._upsert_shelf_layer(
-                    cur=cur,
-                    itemid=itemid,
-                    expirationdate=expirationdate,
-                    quantity=quantity,
-                    cost_per_unit=cost_per_unit,
-                    locid=locid,
-                    created_by=created_by,
-                )
-
-    # ───────────────────── public look‑ups (unchanged) ─────────────────────
-    def get_all_items(self) -> pd.DataFrame:
-        df = self.fetch_data(
-            """
-            SELECT itemid,
-                   itemnameenglish AS itemname,
-                   shelfthreshold,
-                   shelfaverage
-              FROM item
-          ORDER BY itemnameenglish;
-            """
-        )
-        if not df.empty:
-            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
-            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
-        return df
-
-    def get_shelf_quantity_by_item(self) -> pd.DataFrame:
-        df = self.fetch_data(
+    # ───────────────────────── current KPI ─────────────────────────
+    def shelf_kpis(self) -> pd.DataFrame:
+        return self.fetch_data(
             """
             SELECT i.itemid,
-                   i.itemnameenglish AS itemname,
-                   COALESCE(SUM(s.quantity),0) AS totalquantity,
+                   i.itemnameenglish,
+                   COALESCE(SUM(s.quantity),0)::int AS totalqty,
                    i.shelfthreshold,
                    i.shelfaverage
-              FROM item i
-         LEFT JOIN shelf s ON s.itemid = i.itemid
-          GROUP BY i.itemid,i.itemnameenglish,
-                   i.shelfthreshold,i.shelfaverage
-          ORDER BY i.itemnameenglish;
+            FROM   item i
+            LEFT JOIN shelf s ON s.itemid = i.itemid
+            GROUP  BY i.itemid, i.itemnameenglish,
+                      i.shelfthreshold, i.shelfaverage
             """
         )
-        if not df.empty:
-            df["totalquantity"]  = df["totalquantity"].astype(int)
-            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
-            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
-        return df
 
-    # ───────── shortage resolver (unchanged) ─────────
-    def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
-        rows = self.fetch_data(
-            """
-            SELECT shortageid, shortage_qty
-              FROM shelf_shortage
-             WHERE itemid   = %s
-               AND resolved = FALSE
-          ORDER BY logged_at
-            """,
+    # ─────────────────── helpers (mappings) ────────────────────
+    def loc_for_item(self, itemid: int) -> str:
+        res = self.fetch_data(
+            "SELECT locid FROM item_slot WHERE itemid = %s LIMIT 1",
             (itemid,),
         )
-        remaining = qty_need
-        for r in rows.itertuples():
-            if remaining == 0:
-                break
-            take = min(remaining, int(r.shortage_qty))
-            if take == r.shortage_qty:
-                self.execute_command(
-                    "DELETE FROM shelf_shortage WHERE shortageid = %s", (r.shortageid,)
+        return DEFAULT_LOCID if res.empty else res.iloc[0, 0]
+
+    # ─────────────────── BULK refill API ────────────────────
+    def restock_items_bulk(self, df_need: pd.DataFrame) -> list[dict]:
+        """
+        df_need cols → itemid • need  
+        Returns list[dict] for UI logging.
+        """
+        if df_need.empty:
+            return []
+
+        # 1️⃣  Build list of inventory layers to pull
+        inv_layers = []
+        for _, r in df_need.iterrows():
+            it, need = int(r.itemid), int(r.need)
+            layers = self.fetch_data(
+                """
+                SELECT expirationdate, quantity, cost_per_unit
+                FROM   inventory
+                WHERE  itemid=%s AND quantity>0
+                ORDER  BY expirationdate, cost_per_unit
+                """,
+                (it,),
+            )
+            for lyr in layers.itertuples():
+                take = min(need, int(lyr.quantity))
+                inv_layers.append(
+                    dict(itemid=it,
+                         exp=lyr.expirationdate,
+                         take=take,
+                         cpu=float(lyr.cost_per_unit),
+                         loc=self.loc_for_item(it))
                 )
-            else:
-                self.execute_command(
+                need -= take
+                if need == 0:
+                    break
+
+        if not inv_layers:
+            return []
+
+        # 2️⃣  Single transaction: UPDATE inventory −qty & UPSERT to shelf
+        with self.conn:
+            with self.conn.cursor() as cur:
+                # batch inventory decrements via VALUES‑list UPDATE
+                execute_values(
+                    cur,
                     """
-                    UPDATE shelf_shortage
-                       SET shortage_qty = shortage_qty - %s,
-                           resolved_qty  = COALESCE(resolved_qty,0)+%s,
-                           resolved_by   = %s,
-                           resolved_at   = CURRENT_TIMESTAMP
-                     WHERE shortageid = %s
+                    UPDATE inventory AS inv
+                    SET    quantity = inv.quantity - v.take
+                    FROM  (VALUES %s) AS v(itemid,exp,cpu,take)
+                    WHERE inv.itemid=v.itemid
+                      AND inv.expirationdate=v.exp
+                      AND inv.cost_per_unit=v.cpu
                     """,
-                    (take, take, user, r.shortageid),
+                    [(l["itemid"], l["exp"], l["cpu"], l["take"])
+                     for l in inv_layers],
                 )
-            remaining -= take
-        return remaining
+
+                # batch UPSERT into shelf
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO shelf
+                          (itemid,expirationdate,quantity,
+                           cost_per_unit,locid)
+                    VALUES %s
+                    ON CONFLICT (itemid,expirationdate,cost_per_unit,locid)
+                    DO UPDATE SET quantity = shelf.quantity + EXCLUDED.quantity,
+                                  lastupdated = CURRENT_TIMESTAMP
+                    """,
+                    [(l["itemid"], l["exp"], l["take"],
+                      l["cpu"], l["loc"])
+                     for l in inv_layers],
+                )
+
+        # 3️⃣  return compact log
+        return [
+            dict(itemid=l["itemid"], added=l["take"],
+                 locid=l["loc"], exp=l["exp"])
+            for l in inv_layers
+        ]
