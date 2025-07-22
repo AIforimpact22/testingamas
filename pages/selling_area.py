@@ -1,7 +1,7 @@
 """
-🗄️  Shelf Auto‑Refill  – bulk mode
-Press **Start** and the loop moves inventory → shelf in one bulk
-transaction every cycle until each SKU reaches `shelfaverage`
+🗄️ Shelf Auto‑Refill (bulk)
+Press **Start** – every cycle moves inventory → shelf in one bulk
+transaction until each SKU reaches `shelfaverage`
 (or at least `shelfthreshold`).
 """
 
@@ -13,8 +13,7 @@ import pandas as pd
 
 from handler.selling_area_handler import SellingAreaHandler
 
-# ───────── page config ─────────
-st.set_page_config(page_title="Shelf Auto‑Refill", page_icon="🗄️")
+st.set_page_config("Shelf Auto‑Refill", "🗄️")
 st.title("🗄️ Shelf Auto‑Refill (bulk)")
 
 # ───────── interval controls ─────────
@@ -22,20 +21,20 @@ unit  = st.sidebar.selectbox("Interval unit", ("Seconds", "Minutes"))
 value = st.sidebar.number_input("Every …", 1, step=1, value=15)
 INTERVAL = value * (60 if unit == "Minutes" else 1)
 
-# ───────── init session state ─────────
-for k, v in {
-    "s_run": False,
-    "s_last": 0.0,
-    "s_cycles": 0,
-    "s_log": [],
-}.items():
-    st.session_state.setdefault(k, v)
+# ───────── session state ─────────
+st.session_state.setdefault("s_run",    False)
+st.session_state.setdefault("s_last",   0.0)
+st.session_state.setdefault("s_cycles", 0)
+st.session_state.setdefault("s_log",    [])
 
 RUN = st.session_state["s_run"]
+
 c1, c2 = st.columns(2)
 if c1.button("▶ Start", disabled=RUN):
-    st.session_state.update(s_run=True, s_last=0.0,
-                            s_cycles=0, s_log=[])
+    st.session_state.update(s_run=True,
+                            s_last=0.0,
+                            s_cycles=0,
+                            s_log=[])
     RUN = True
 if c2.button("⏹ Stop", disabled=not RUN):
     st.session_state["s_run"] = False
@@ -51,9 +50,11 @@ def cycle() -> list[dict]:
     df = snapshot()
     df["threshold"] = df["shelfthreshold"].fillna(0)
     df["average"]   = df["shelfaverage"].fillna(df["threshold"])
+
     below = df[df.totalqty < df.threshold].copy()
-    if below.empty():
-        return []                 # <- guard
+    if below.empty:           # ← fixed (no parentheses)
+        return []
+
     below["need"] = below["average"] - below["totalqty"]
     below = below[below.need > 0]
     return sa.restock_items_bulk(below[["itemid", "need"]])
@@ -62,8 +63,8 @@ def cycle() -> list[dict]:
 if RUN:
     now = time.time()
     if now - st.session_state["s_last"] >= INTERVAL:
-        st.session_state["s_log"]   = cycle()
-        st.session_state["s_last"]  = now
+        st.session_state["s_log"]    = cycle()
+        st.session_state["s_last"]   = now
         st.session_state["s_cycles"] += 1
 
     st.metric("Cycles",      st.session_state["s_cycles"])
