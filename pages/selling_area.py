@@ -2,17 +2,19 @@
 🗄️ Shelf Auto‑Refill (bulk)
 Press **Start** – every cycle moves inventory → shelf in one bulk
 transaction until each SKU reaches `shelfaverage`
-(or at least `shelfthreshold`).
+(or, if that is NULL, at least `shelfthreshold`).
 """
 
 from __future__ import annotations
 import time
 from datetime import datetime
+
 import streamlit as st
 import pandas as pd
 
 from handler.selling_area_handler import SellingAreaHandler
 
+# ───────── page setup ─────────
 st.set_page_config("Shelf Auto‑Refill", "🗄️")
 st.title("🗄️ Shelf Auto‑Refill (bulk)")
 
@@ -25,7 +27,7 @@ INTERVAL = value * (60 if unit == "Minutes" else 1)
 st.session_state.setdefault("s_run",    False)
 st.session_state.setdefault("s_last",   0.0)
 st.session_state.setdefault("s_cycles", 0)
-st.session_state.setdefault("s_log",    [])
+st.session_state.setdefault("s_log",    [])      # last‑cycle rows
 
 RUN = st.session_state["s_run"]
 
@@ -42,22 +44,26 @@ if c2.button("⏹ Stop", disabled=not RUN):
 
 sa = SellingAreaHandler()
 
-@st.cache_data(ttl=300, show_spinner=False)
 def snapshot() -> pd.DataFrame:
+    """Always fresh – no Streamlit caching to avoid stale data."""
     return sa.shelf_kpis()
 
 def cycle() -> list[dict]:
     df = snapshot()
-    df["threshold"] = df["shelfthreshold"].fillna(0)
-    df["average"]   = df["shelfaverage"].fillna(df["threshold"])
+    # thresholds may be NULL; treat NULL as 0
+    df["threshold"] = df["shelfthreshold"].fillna(0).astype(int)
+    df["average"]   = df["shelfaverage"].fillna(df["threshold"]).astype(int)
 
-    below = df[df.totalqty < df.threshold].copy()
-    if below.empty:           # ← fixed (no parentheses)
+    # target = shelfaverage if defined else shelfthreshold
+    df["target"] = df["average"].where(df["average"] > 0, df["threshold"])
+    need_df = df[df.totalqty < df["target"]].copy()
+    if need_df.empty:
         return []
 
-    below["need"] = below["average"] - below["totalqty"]
-    below = below[below.need > 0]
-    return sa.restock_items_bulk(below[["itemid", "need"]])
+    need_df["need"] = need_df["target"] - need_df["totalqty"]
+    need_df = need_df[need_df.need > 0]
+
+    return sa.restock_items_bulk(need_df[["itemid", "need"]])
 
 # ───────── main loop ─────────
 if RUN:
@@ -67,14 +73,12 @@ if RUN:
         st.session_state["s_last"]   = now
         st.session_state["s_cycles"] += 1
 
-    st.metric("Cycles",      st.session_state["s_cycles"])
+    st.metric("Cycles run",  st.session_state["s_cycles"])
     st.metric("Rows moved",  len(st.session_state["s_log"]))
-    st.metric(
-        "Last cycle",
-        datetime.fromtimestamp(st.session_state["s_last"]).strftime("%F %T"),
-    )
+    ts = datetime.fromtimestamp(st.session_state["s_last"]).strftime("%F %T")
+    st.metric("Last cycle", ts)
 
-    time.sleep(0.3)
+    time.sleep(0.3)      # let the UI breathe ☺
     st.rerun()
 else:
     st.info("Press **Start** to begin automatic shelf top‑ups.")
