@@ -1,115 +1,120 @@
 # pages/inventory.py
 """
-📦 Inventory Auto‑Refill
-────────────────────────
-Press **Start** – every cycle bulk‑refills inventory up to
-`averagerequired`.  Live progress bar + action log appended.
+📦 Inventory Auto‑Refill – with live debug view
 """
 
 from __future__ import annotations
-
 import time
 from datetime import datetime
-
 import pandas as pd
 import streamlit as st
-
 from handler.inventory_handler import InventoryHandler
 
-# ──────────────── Streamlit setup ────────────────
+# ───────── Streamlit config ─────────
 st.set_page_config(page_title="Inventory Auto‑Refill", page_icon="📦")
 st.title("📦 Inventory Auto‑Refill")
 
-# ──────────────── sidebar interval ────────────────
+# ───────── sidebar controls ─────────
 unit  = st.sidebar.selectbox("Interval unit", ("Seconds", "Minutes", "Hours"))
 value = st.sidebar.number_input("Every …", min_value=1, step=1, value=30)
 INTERVAL = value * {"Seconds": 1, "Minutes": 60, "Hours": 3600}[unit]
 
-# ──────────────── session state ────────────────
-defaults = dict(
-    inv_run   = False,
-    last_ts   = 0.0,
-    cycles    = 0,
-    last_log  = [],            # current‑cycle log (overwritten)
-    all_logs  = [],            # cumulative
-)
+DEBUG_MODE = st.sidebar.checkbox("🔍 Debug mode")
+
+# ───────── session state ─────────
+defaults = dict(inv_run=False, last_ts=0.0, cycles=0,
+                last_log=[], all_logs=[])
 for k, v in defaults.items():
     st.session_state.setdefault(k, v)
 
-RUN = st.session_state.inv_run
 inv = InventoryHandler()
 
-# ──────────────── small helpers ────────────────
-def take_snapshot() -> pd.DataFrame:
-    """Always hit the DB – no caching to avoid stale data."""
+# ───────── helper fns ─────────
+def snapshot() -> pd.DataFrame:
     return inv.stock_levels()
 
-def one_cycle() -> list[dict]:
-    snap  = take_snapshot()
+def one_cycle() -> dict:
+    snap  = snapshot()
+
+    # show in debug
+    if DEBUG_MODE:
+        st.subheader("Snapshot")
+        st.dataframe(snap, height=300, use_container_width=True)
+
     below = snap[snap.totalqty < snap.threshold].copy()
     if below.empty:
-        return []
-    below["need"] = below["average"] - below["totalqty"]
+        return {"log": [], "by_supplier": {}}
+
+    # safe target when average is 0 / NULL
+    below["target"] = below[["average", "threshold"]].max(axis=1)
+    below["need"]   = below["target"] - below["totalqty"]
+    below = below[below.need > 0]
+
+    if DEBUG_MODE:
+        st.subheader("Below threshold")
+        st.dataframe(below, height=300, use_container_width=True)
+
     return inv.restock_items_bulk(
-        below[["itemid", "need", "sellingprice"]]
+        below[["itemid", "need", "sellingprice"]], debug=DEBUG_MODE
     )
 
-# ──────────────── start / stop buttons ────────────────
-c1, c2 = st.columns(2)
-if c1.button("▶ Start", disabled=RUN):
-    st.session_state.update(inv_run=True, last_ts=0.0, cycles=0,
-                            last_log=[], all_logs=[])
-    RUN = True
-if c2.button("⏹ Stop", disabled=not RUN):
+# ───────── start / stop ─────────
+col_start, col_stop = st.columns(2)
+if col_start.button("▶ Start", disabled=st.session_state.inv_run):
+    st.session_state.update(inv_run=True, last_ts=0.0,
+                            cycles=0, last_log=[], all_logs=[])
+if col_stop.button("⏹ Stop", disabled=not st.session_state.inv_run):
     st.session_state.inv_run = False
-    RUN = False
 
-# ──────────────── main loop ────────────────
-placeholder_metrics = st.empty()
-placeholder_progress = st.empty()
-placeholder_log = st.expander("▼ Last cycle log", expanded=False)
-
-if RUN:
+# ───────── main loop ─────────
+if st.session_state.inv_run:
     now = time.time()
     remaining = max(0.0, INTERVAL - (now - st.session_state.last_ts))
 
     if remaining == 0:
-        # do the work
         try:
-            cycle_log = one_cycle()
-        except Exception as exc:
-            st.error(f"⚠️ Database error: {exc!s}")
+            result = one_cycle()
+        except Exception as exc:            # surface any SQL / lock errors
+            st.error(f"⛔ {exc!s}")
             st.session_state.inv_run = False
             st.stop()
 
-        st.session_state.update(
-            last_ts=time.time(),
-            cycles=st.session_state.cycles + 1,
-            last_log=cycle_log,
-            all_logs=st.session_state.all_logs + cycle_log,
-        )
-        remaining = INTERVAL     # reset the countdown
+        st.session_state.last_ts = time.time()
+        st.session_state.cycles += 1
+        st.session_state.last_log = result["log"]
+        st.session_state.all_logs.extend(result["log"])
+        remaining = INTERVAL
 
-    # ────────── live widgets ──────────
-    placeholder_metrics.metric("Cycles", st.session_state.cycles)
-    placeholder_metrics.metric("Rows added", len(st.session_state.last_log))
-    placeholder_metrics.metric(
+        if DEBUG_MODE and result["by_supplier"]:
+            st.subheader("Refill groups (per supplier)")
+            for sup, df_sup in result["by_supplier"].items():
+                with st.expander(f"Supplier {sup} – {len(df_sup)} rows"):
+                    st.dataframe(df_sup, use_container_width=True)
+
+    # ── metrics ──
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cycles",     st.session_state.cycles)
+    c2.metric("Rows added", len(st.session_state.last_log))
+    c3.metric(
         "Last run",
-        datetime.fromtimestamp(
-            st.session_state.last_ts
-        ).strftime("%F %T") if st.session_state.last_ts else "—",
+        datetime.fromtimestamp(st.session_state.last_ts).strftime("%F %T")
+        if st.session_state.last_ts else "—",
     )
 
-    placeholder_progress.progress(
-        1.0 - remaining / INTERVAL,
-        text=f"Next cycle in {int(remaining)} s",
-    )
+    # ── progress bar ──
+    st.progress(1.0 - remaining / INTERVAL,
+                text=f"Next cycle in {int(remaining)} s")
 
-    if st.session_state.last_log:
-        df_log = pd.DataFrame(st.session_state.last_log)
-        placeholder_log.dataframe(df_log, use_container_width=True)
+    # ── last‑cycle log ──
+    with st.expander("Last cycle log", expanded=False):
+        if st.session_state.last_log:
+            st.dataframe(
+                pd.DataFrame(st.session_state.last_log),
+                use_container_width=True,
+            )
+        else:
+            st.write("Nothing added last cycle.")
 
-    # gentle yield so the UI can refresh smoothly
     time.sleep(0.1)
     st.rerun()
 else:
