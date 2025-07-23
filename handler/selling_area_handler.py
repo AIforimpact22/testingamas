@@ -1,8 +1,11 @@
 from __future__ import annotations
 from functools import lru_cache
 from typing import Any
+
 import pandas as pd
+
 from db_handler import DatabaseManager
+
 
 class SellingAreaHandler(DatabaseManager):
     # ───────────── small helpers ─────────────
@@ -45,6 +48,7 @@ class SellingAreaHandler(DatabaseManager):
             (itemid, expirationdate, quantity, created_by, locid),
         )
 
+    # ───────────── public API ─────────────
     def transfer_from_inventory(
         self,
         *,
@@ -87,6 +91,7 @@ class SellingAreaHandler(DatabaseManager):
                     created_by=created_by,
                 )
 
+    # ───────────── data access wrappers ─────────────
     def fetch_data(self, sql: str, params: tuple = ()) -> pd.DataFrame:
         with self.conn:
             return pd.read_sql_query(sql, self.conn, params=params)
@@ -96,6 +101,7 @@ class SellingAreaHandler(DatabaseManager):
             with self.conn.cursor() as cur:
                 cur.execute(sql, params)
 
+    # ───────────── shortage resolver ─────────────
     def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
         rows = self.fetch_data(
             """
@@ -114,7 +120,8 @@ class SellingAreaHandler(DatabaseManager):
             take = min(remaining, int(r.shortage_qty))
             if take == r.shortage_qty:
                 self.execute_command(
-                    "DELETE FROM shelf_shortage WHERE shortageid = %s", (r.shortageid,)
+                    "DELETE FROM shelf_shortage WHERE shortageid = %s",
+                    (r.shortageid,),
                 )
             else:
                 self.execute_command(
@@ -131,9 +138,43 @@ class SellingAreaHandler(DatabaseManager):
             remaining -= take
         return remaining
 
+    # ───────────── KPI helpers (used by POS.py) ─────────────
+    def get_all_items(self) -> pd.DataFrame:
+        """
+        Returns one row per catalog item with shelf KPI settings.
+        Columns expected by POS.shelf_cycle():
+            itemid | itemname | shelfthreshold | shelfaverage
+        """
+        return self.fetch_data(
+            """
+            SELECT itemid,
+                   itemnameenglish AS itemname,
+                   COALESCE(shelfthreshold, 0)::int AS shelfthreshold,
+                   COALESCE(shelfaverage,
+                            shelfthreshold,
+                            0)::int          AS shelfaverage
+              FROM item
+            """
+        )
+
+    def get_shelf_quantity_by_item(self) -> pd.DataFrame:
+        """
+        Aggregates current shelf stock.
+        Returns columns: itemid | totalquantity
+        """
+        return self.fetch_data(
+            """
+            SELECT itemid,
+                   COALESCE(SUM(quantity), 0)::int AS totalquantity
+              FROM shelf
+             GROUP BY itemid
+            """
+        )
+
+    # ───────────── optional helper (kept from original) ─────────────
     def get_items_below_shelfthreshold(self) -> pd.DataFrame:
         """
-        Returns only items whose current shelf quantity is below their threshold.
+        Returns only items whose current shelf quantity is below threshold.
         """
         df = self.fetch_data(
             """
