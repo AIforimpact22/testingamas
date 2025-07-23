@@ -1,3 +1,14 @@
+# handler/selling_area_handler.py  – full import block
+from __future__ import annotations
+from functools import lru_cache
+from typing import Any
+import pandas as pd
+
+from psycopg2.extras import execute_values      # bulk helpers
+from db_handler import DatabaseManager          # ←← this line was missing!
+
+
+
 # ─────────────────────────────── NEW  IMPORT ───────────────────────────────
 from psycopg2.extras import execute_values               # ⬅️ add to imports
 
