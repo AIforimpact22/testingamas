@@ -1,80 +1,74 @@
 from __future__ import annotations
 """
-Selling‑Area Auto‑Refill
-────────────────────────────────────────────
-Press **Start** to begin; the checker runs forever
-at the chosen interval until you press **Stop**.
-
-Logic
-• Every cycle: compare each SKU’s shelf qty vs. `shelfthreshold`
-  (fallback 0) from the *item* table.
-• If below threshold → move oldest inventory layers → shelf
-  up to `shelfaverage` (fallback = threshold) while resolving
-  open shortages.
-• New shortages created here use `saleid = 0`.
-• Shelf locations are read from **item_slot(itemid,locid)**.
+🗄️ Shelf Auto‑Refill – refactored with Debug mode
 """
 
 import time
+import traceback
 from datetime import datetime
-import streamlit as st
+
 import pandas as pd
+import streamlit as st
 
 from handler.selling_area_handler import SellingAreaHandler
 
-# ─────────── page config ───────────
+# ─────────── UI basics ───────────
 st.set_page_config(page_title="Shelf Auto‑Refill", page_icon="🗄️")
 st.title("🗄️ Shelf Auto‑Refill")
 
-# ─────────── sidebar interval ───────────
-st.sidebar.header("Check every …")
+# interval
 UNIT  = st.sidebar.selectbox("Unit", ("Seconds", "Minutes", "Hours", "Days"))
-VALUE = st.sidebar.number_input("Interval", min_value=1, step=1, value=10)
+VAL   = st.sidebar.number_input("Interval", 1, step=1, value=10)
+SECONDS = VAL * {"Seconds": 1, "Minutes": 60, "Hours": 3600, "Days": 86_400}[UNIT]
 
-mult = {"Seconds": 1, "Minutes": 60, "Hours": 3600, "Days": 86_400}[UNIT]
-INTERVAL_SEC = VALUE * mult
+DEBUG = st.sidebar.checkbox("🔍 Debug mode")
 
-# ─────────── start / stop buttons ───────────
-RUNNING = st.session_state.get("shelf_running", False)
-col_start, col_stop = st.columns(2)
-if col_start.button("▶ Start", disabled=RUNNING):
-    st.session_state.update(
-        shelf_running=True,
-        last_check_ts=time.time() - INTERVAL_SEC,  # run immediately
-        cycle_count=0,
-        last_result=[],
-    )
-    RUNNING = True
+# session defaults
+st.session_state.setdefault("running", False)
+st.session_state.setdefault("last_ts", 0.0)
+st.session_state.setdefault("cycles", 0)
+st.session_state.setdefault("last_log", [])
 
-if col_stop.button("⏹ Stop", disabled=not RUNNING):
-    st.session_state["shelf_running"] = False
-    RUNNING = False
+# start/stop
+c1, c2 = st.columns(2)
+if c1.button("▶ Start", disabled=st.session_state.running):
+    st.session_state.update(running=True,
+                            last_ts=time.time() - SECONDS,
+                            cycles=0,
+                            last_log=[])
+if c2.button("⏹ Stop", disabled=not st.session_state.running):
+    st.session_state.running = False
 
-# ─────────── helpers ───────────
-shelf = SellingAreaHandler()
-DUMMY_SALEID = 0
+# instantiate handler once
+handler = SellingAreaHandler()
+USER = "AUTO‑SHELF"
+DUMMY_SALEID = 0     # unchanged
 
-@st.cache_data(ttl=300, show_spinner=False)
-def item_meta() -> pd.DataFrame:
-    return shelf.get_all_items().set_index("itemid")
+# ─────────── cached static meta ───────────
+@st.cache_data(ttl=600, show_spinner=False)
+def load_item_meta() -> pd.DataFrame:
+    return handler.get_all_items().set_index("itemid")
 
-def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
-    meta = item_meta()
-    kpi  = shelf.get_shelf_quantity_by_item()
-    rowk = kpi.loc[kpi.itemid == itemid]
-    current = int(rowk.totalquantity.iloc[0]) if not rowk.empty else 0
-
-    threshold = int(meta.at[itemid, "shelfthreshold"] or 0)
-    average   = int(meta.at[itemid, "shelfaverage"]   or threshold or 0)
-    if current >= threshold:
+# ─────────── refilled‑per‑item function ───────────
+def refill_item(
+    *,
+    itemid: int,
+    current_qty: int,
+    meta: pd.Series,
+) -> str:
+    threshold = meta.shelfthreshold
+    average   = meta.shelfaverage
+    if current_qty >= threshold:
         return "OK"
 
-    need = max(average - current, threshold - current)
-    need = shelf.resolve_shortages(itemid=itemid, qty_need=need, user=user)
+    need = max(average - current_qty, threshold - current_qty)
+
+    # resolve open shortages
+    need = handler.resolve_shortages(itemid=itemid, qty_need=need, user=USER)
     if need <= 0:
         return "Shortage cleared"
 
-    layers = shelf.fetch_data(
+    layers = handler.fetch_data(
         """
         SELECT expirationdate, quantity, cost_per_unit
           FROM inventory
@@ -85,67 +79,88 @@ def restock_item(itemid: int, *, user="AUTO‑SHELF") -> str:
     )
     for lyr in layers.itertuples():
         take = min(need, int(lyr.quantity))
-        shelf.transfer_from_inventory(
+        handler.transfer_from_inventory(
             itemid=itemid,
             expirationdate=lyr.expirationdate,
             quantity=take,
             cost_per_unit=float(lyr.cost_per_unit),
-            created_by=user,
+            created_by=USER,
         )
         need -= take
         if need == 0:
             return "Refilled"
 
-    # not enough inventory → shortage row (saleid = 0)
-    shelf.execute_command(
+    # not enough inventory – log shortage
+    handler.execute_command(
         """
         INSERT INTO shelf_shortage
               (saleid, itemid, shortage_qty, logged_at)
-        VALUES (%s,     %s,     %s,           CURRENT_TIMESTAMP)
+        VALUES (%s,%s,%s,CURRENT_TIMESTAMP)
         """,
         (DUMMY_SALEID, itemid, need),
     )
     return f"Partial (short {need})"
 
+# ─────────── one full cycle ───────────
 def run_cycle() -> list[dict]:
-    """One full pass – returns list of action dicts for UI."""
-    kpi  = shelf.get_shelf_quantity_by_item()
-    meta = item_meta().reset_index()
+    meta_df = load_item_meta()
+    qty_df  = handler.get_shelf_quantity_by_item().set_index("itemid")
+    merged  = meta_df.join(qty_df, how="left").fillna({"totalquantity": 0})
+    merged["totalquantity"] = merged.totalquantity.astype(int)
 
-    df = kpi.merge(
-        meta[["itemid", "shelfthreshold", "shelfaverage"]],
-        on="itemid",
-        how="left",
-        suffixes=("", "_meta"),
-    )
-    # pandas 2.x – avoid chained‑assignment warning
-    df["shelfthreshold"] = df["shelfthreshold"].fillna(df["shelfthreshold_meta"])
-    df["shelfaverage"]   = df["shelfaverage"].fillna(df["shelfaverage_meta"])
+    below = merged[merged.totalquantity < merged.shelfthreshold]
 
-    below = df[df.totalquantity < df.shelfthreshold]
-    actions: list[dict] = []
-    for _, r in below.iterrows():
-        status = restock_item(int(r.itemid))
-        actions.append({"item": r.itemname, "action": status})
-    return actions
+    if DEBUG:
+        st.subheader("Merged snapshot")
+        st.dataframe(merged, use_container_width=True)
+        st.subheader("Below threshold")
+        st.dataframe(below, use_container_width=True)
+
+    log: list[dict] = []
+    for itemid, row in below.iterrows():
+        action = refill_item(
+            itemid=itemid,
+            current_qty=row.totalquantity,
+            meta=row,
+        )
+        log.append({"item": row.itemname, "action": action})
+    return log
 
 # ─────────── main loop ───────────
-if RUNNING:
+if st.session_state.running:
     now = time.time()
-    if now - st.session_state["last_check_ts"] >= INTERVAL_SEC:
-        st.session_state["last_result"]   = run_cycle()
-        st.session_state["last_check_ts"] = now
-        st.session_state["cycle_count"]  += 1
+    rem = SECONDS - (now - st.session_state.last_ts)
+    if rem <= 0:
+        try:
+            st.session_state.last_log = run_cycle()
+        except Exception as exc:
+            st.error("⛔ " + "".join(traceback.format_exception_only(type(exc), exc)))
+            st.session_state.running = False
+            st.stop()
 
-    st.metric("Cycles run", st.session_state["cycle_count"])
-    st.metric(
-        "Last cycle",
-        datetime.fromtimestamp(st.session_state["last_check_ts"]).strftime("%F %T"),
+        st.session_state.last_ts = time.time()
+        st.session_state.cycles += 1
+        rem = SECONDS
+
+    # metrics
+    cc1, cc2, cc3 = st.columns(3)
+    cc1.metric("Cycles",     st.session_state.cycles)
+    cc2.metric("Processed",  len(st.session_state.last_log))
+    cc3.metric(
+        "Last run",
+        datetime.fromtimestamp(st.session_state.last_ts).strftime("%F %T"),
     )
-    st.metric("SKUs processed last cycle", len(st.session_state["last_result"]))
 
-    # small sleep to yield control, then immediate self‑rerun
-    time.sleep(0.2)
+    st.progress(1 - rem / SECONDS, text=f"Next cycle in {int(rem)} s")
+
+    with st.expander("Last cycle log", expanded=False):
+        if st.session_state.last_log:
+            st.dataframe(pd.DataFrame(st.session_state.last_log),
+                         use_container_width=True)
+        else:
+            st.write("— nothing this time —")
+
+    time.sleep(0.15)
     st.rerun()
 else:
     st.info("Press **Start** to begin automatic shelf top‑ups.")
