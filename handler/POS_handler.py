@@ -8,15 +8,16 @@ Responsibilities
 • Create `sales` header rows and `salesitems` detail rows.
 • Deduct quantities from the *shelf* and log shortages when shelf stock
   cannot cover the requested quantity.
+• **Always record the customer's full basket** in `salesitems` and the
+  header totals, even if some units are back‑ordered (shortage).
+  Those shortages are later cleared by the Shelf‑refill loop.
 
-⚠️  Shelf **auto‑refill** is *not* handled here; that logic lives in the
-    Shelf‑refill page.  This handler only writes a shortage row when needed.
+⚠️  Shelf auto‑refill lives elsewhere; this handler only writes shortages.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import date
 from typing import List, Dict, Any
 
 import pandas as pd
@@ -78,7 +79,7 @@ class POSHandler(DatabaseManager):
                 float(it["totalprice"]),
             )
             for it in items
-            if it["quantity"] > 0          # skip zero‑sold rows
+            if it["quantity"] > 0          # skip zero‑qty edge cases
         ]
         if not rows:
             return
@@ -142,9 +143,10 @@ class POSHandler(DatabaseManager):
     ):
         """
         • Inserts a `sales` header (placeholder totals first).
-        • Deducts stock from shelf; logs shortages with saleid.
-        • Inserts all `salesitems` rows.
-        • Updates header totals.
+        • Deducts what is available from shelf; logs any shortage rows.
+        • ALWAYS records the requested quantity in `salesitems`.
+        • Updates header totals so they match the till receipt even when
+          shortages occur.
 
         Returns
         -------
@@ -164,20 +166,19 @@ class POSHandler(DatabaseManager):
             return None, []
 
         shortages: list[dict] = []
-        lines: list[dict]    = []
+        lines: List[Dict[str, Any]] = []
         running_total = 0.0
 
         for it in cart_items:
-            iid  = int(it["itemid"])
-            req_qty = int(it["quantity"])
-            price   = float(it["sellingprice"])
+            iid      = int(it["itemid"])
+            req_qty  = int(it["quantity"])
+            price    = float(it["sellingprice"])
 
+            # try to fulfil from shelf
             shortage_qty = self._deduct_from_shelf(iid, req_qty)
-            sold_qty     = req_qty - shortage_qty
-            running_total += sold_qty * price
 
+            # log shortage row if needed
             if shortage_qty > 0:
-                # 1) log shortage row
                 self.execute_command(
                     """
                     INSERT INTO shelf_shortage (saleid, itemid, shortage_qty)
@@ -190,18 +191,18 @@ class POSHandler(DatabaseManager):
                 ).iat[0, 0]
                 shortages.append({"itemname": name, "qty": shortage_qty})
 
-            # 2) prepare salesitems row (only if something was sold)
-            if sold_qty > 0:
-                lines.append(
-                    dict(
-                        itemid     = iid,
-                        quantity   = sold_qty,
-                        unitprice  = price,
-                        totalprice = round(sold_qty * price, 2),
-                    )
+            # always record the full requested quantity in the receipt
+            lines.append(
+                dict(
+                    itemid     = iid,
+                    quantity   = req_qty,
+                    unitprice  = price,
+                    totalprice = round(req_qty * price, 2),
                 )
+            )
+            running_total += req_qty * price
 
-        # batch insert items (may be empty if everything was out of stock)
+        # batch insert all line‑items
         self.add_sale_items(saleid, lines)
 
         # update header totals
@@ -210,10 +211,10 @@ class POSHandler(DatabaseManager):
         self.execute_command(
             """
             UPDATE sales
-            SET totalamount   = %s,
-                totaldiscount = %s,
-                finalamount   = %s
-            WHERE saleid = %s
+               SET totalamount   = %s,
+                   totaldiscount = %s,
+                   finalamount   = %s
+             WHERE saleid = %s
             """,
             (running_total, total_disc, final_amt, saleid),
         )
