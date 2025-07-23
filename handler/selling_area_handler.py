@@ -10,7 +10,6 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from handler.selling_area_handler import SellingAreaHandler  # Only import here!
 
 # ─────────── UI basics ───────────
 st.set_page_config(page_title="Shelf Auto‑Refill", page_icon="🗄️")
