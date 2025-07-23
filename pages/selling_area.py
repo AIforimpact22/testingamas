@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-🗄️ Shelf Auto‑Refill – Optimized, UI/Streamlit only (no handler code here)
+🗄️ Shelf Auto‑Refill – Optimized, Progress & Refilled Tab
 """
 
 import time
@@ -28,7 +28,8 @@ st.session_state.setdefault("running", False)
 st.session_state.setdefault("last_ts", 0.0)
 st.session_state.setdefault("cycles", 0)
 st.session_state.setdefault("last_log", [])
-st.session_state.setdefault("history_log", [])   # for full log history
+st.session_state.setdefault("history_log", [])    # for full log history
+st.session_state.setdefault("refilled_log", [])   # for successful refills only
 
 # start/stop
 c1, c2 = st.columns(2)
@@ -37,7 +38,8 @@ if c1.button("▶ Start", disabled=st.session_state.running):
                             last_ts=time.time() - SECONDS,
                             cycles=0,
                             last_log=[],
-                            history_log=[])
+                            history_log=[],
+                            refilled_log=[])
 if c2.button("⏹ Stop", disabled=not st.session_state.running):
     st.session_state.running = False
 
@@ -106,6 +108,7 @@ def run_cycle() -> list[dict]:
         return []
 
     log: list[dict] = []
+    refilled: list[dict] = []
     n = len(below)
     item_progress = st.empty()
     step_bar = st.progress(0, text="Processing items...")
@@ -122,13 +125,24 @@ def run_cycle() -> list[dict]:
             action = f"Error: {e}"
             if DEBUG:
                 st.error(f"Error processing {row.itemname}: {e}")
-        log.append({"item": row.itemname, "action": action})
+        log_entry = {
+            "item": row.itemname,
+            "action": action,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        log.append(log_entry)
+        # Only record real refill events (not just 'OK')
+        if action in ("Refilled", "Shortage cleared") or action.startswith("Partial"):
+            refilled.append(log_entry)
         step_bar.progress(i / n, text=f"Processed {i}/{n}")
         if DEBUG:
             time.sleep(0.15)
     item_progress.success("Cycle complete!")
     step_bar.progress(1.0, text="Done.")
 
+    # Add to session_state
+    if refilled:
+        st.session_state.refilled_log.extend(refilled)
     return log
 
 # ─────────── main loop ───────────
@@ -161,19 +175,31 @@ if st.session_state.running:
 
     st.progress(1 - rem / SECONDS, text=f"Next cycle in {int(rem)} s")
 
-    with st.expander("Last cycle log", expanded=False):
+    # ─────────── TABS FOR LOGS ───────────
+    tab1, tab2, tab3 = st.tabs(["Current Cycle", "All Actions (History)", "Refilled This Session"])
+    with tab1:
+        st.subheader("Last cycle log")
         if st.session_state.last_log:
             st.dataframe(pd.DataFrame(st.session_state.last_log),
                          use_container_width=True)
         else:
             st.write("— nothing this time —")
 
-    with st.expander("All actions this session (history)", expanded=False):
+    with tab2:
+        st.subheader("All actions this session (history)")
         if st.session_state.history_log:
             st.dataframe(pd.DataFrame(st.session_state.history_log),
                          use_container_width=True)
         else:
             st.write("— no actions yet —")
+
+    with tab3:
+        st.subheader("Successfully Refilled/Updated")
+        if st.session_state.refilled_log:
+            st.dataframe(pd.DataFrame(st.session_state.refilled_log),
+                         use_container_width=True)
+        else:
+            st.write("— no successful refills yet —")
 
     time.sleep(0.15)
     st.rerun()
