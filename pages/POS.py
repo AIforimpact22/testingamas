@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-🛒 Unified POS • Inventory • Shelf controller
+🛒 POS  +  Inventory  +  Shelf automation – parallel cashiers
 """
 
 import time
@@ -15,88 +15,84 @@ from handler.POS_handler import POSHandler
 from handler.inventory_handler import InventoryHandler
 from handler.selling_area_handler import SellingAreaHandler
 
-# ─────────────── UI config ───────────────
+# ───────────── UI CONFIG ─────────────
 st.set_page_config(page_title="Unified POS / Refill", page_icon="🛒")
 st.title("🛒 POS + Inventory + Shelf automation")
 
-# ─────────────── sidebar – POS params ───────────────
+# ───────────── SIDEBAR – POS PARAMS ─────────────
 st.sidebar.header("POS parameters")
-SPEED   = st.sidebar.number_input("Speed multiplier (×)", 1, 200, 1, 1)
-PROFILE = st.sidebar.selectbox("Load profile",
-                               ("Standard (steady)", "Real‑time market curve"))
-CASHIERS = st.sidebar.slider("Active cashiers", 1, 10, 3)
+SPEED     = st.sidebar.number_input("Speed multiplier (×)", 1, 200, 1, 1)
+PROFILE   = st.sidebar.selectbox(
+    "Load profile", ("Standard (steady)", "Real‑time market curve")
+)
+CASHIERS  = st.sidebar.slider("Active cashiers", 1, 10, 3)
 
 min_items = st.sidebar.number_input("Min items / sale", 1, 20, 2)
 max_items = st.sidebar.number_input("Max items / sale", min_items, 30, 6)
 min_qty   = st.sidebar.number_input("Min qty / item", 1, 20, 1)
 max_qty   = st.sidebar.number_input("Max qty / item", min_qty, 50, 5)
 
-# ─────────────── sidebar – refill intervals ───────────────
+# ───────────── SIDEBAR – REFILL INTERVALS ─────────────
 st.sidebar.header("Automation intervals")
-def pick_interval(label: str, default_val: int, default_unit: str = "Minutes"):
+def _interval(label: str, default_val: int, default_unit="Minutes") -> int:
     unit  = st.sidebar.selectbox(f"{label} unit",
                                  ("Seconds", "Minutes", "Hours", "Days"),
                                  key=f"{label}_unit",
-                                 index={"Seconds":0,"Minutes":1,
-                                        "Hours":2,"Days":3}[default_unit])
-    val   = st.sidebar.number_input(f"{label} value",
-                                    1, step=1, value=default_val,
-                                    key=f"{label}_value")
-    sec = val * {"Seconds":1,"Minutes":60,"Hours":3600,"Days":86_400}[unit]
-    return sec
+                                 index={"Seconds":0,"Minutes":1,"Hours":2,"Days":3}[default_unit])
+    val   = st.sidebar.number_input(f"{label} value", 1, step=1,
+                                    value=default_val, key=f"{label}_val")
+    return val * {"Seconds":1, "Minutes":60, "Hours":3600, "Days":86_400}[unit]
 
-INV_SEC   = pick_interval("Inventory refill", 30)
-SHELF_SEC = pick_interval("Shelf refill",     10)
+INV_SEC   = _interval("Inventory refill", 30)
+SHELF_SEC = _interval("Shelf refill",     10)
 
-# ─────────────── Start / Stop ───────────────
+# ───────────── START / STOP ─────────────
 RUN = st.session_state.get("unified_run", False)
-c1, c2 = st.columns(2)
-if c1.button("▶ Start", disabled=RUN):
+b1, b2 = st.columns(2)
+if b1.button("▶ Start", disabled=RUN):
     now = datetime.now()
+    st.session_state.clear()         # clean slate
     st.session_state.update(
         unified_run=True,
-        # POS
-        sim_clock=now,
+        # global real‑time anchor
         real_ts=time.time(),
-        next_sale_sim_ts=now,
+        # POS clocks
+        sim_clock=now,
+        next_sale_times=[now] * CASHIERS,   # one timer per cashier
         sales_count=0,
-        # Inventory
+        # Inventory timers
         inv_last_ts=time.time() - INV_SEC,
-        inv_cycles=0,
-        last_inv_rows=0,
-        # Shelf
+        inv_cycles=0,  last_inv_rows=0,
+        # Shelf timers
         sh_last_ts=time.time() - SHELF_SEC,
-        sh_cycles=0,
-        last_sh_rows=0,
+        sh_cycles=0,   last_sh_rows=0,
     )
     RUN = True
-if c2.button("⏹ Stop", disabled=not RUN):
+if b2.button("⏹ Stop", disabled=not RUN):
     st.session_state.unified_run = False
     RUN = False
 
-# ─────────────── handlers & static data ───────────────
+# ───────────── HANDLERS & STATIC DATA ─────────────
 POS   = POSHandler()
 INV   = InventoryHandler()
 SHELF = SellingAreaHandler()
 
 @st.cache_data(ttl=600, show_spinner=False)
-def item_catalogue() -> pd.DataFrame:
+def catalogue() -> pd.DataFrame:
     return POS.fetch_data(
-        """
-        SELECT itemid, sellingprice
-        FROM   item
-        WHERE  sellingprice IS NOT NULL AND sellingprice > 0
-        """
+        "SELECT itemid, sellingprice FROM item "
+        "WHERE sellingprice IS NOT NULL AND sellingprice > 0"
     )
-CATALOG = item_catalogue()
+CAT = catalogue()
 
+# ───────────── SMALL HELPERS ─────────────
 def random_cart() -> list[dict]:
-    n_available = len(CATALOG)
-    if n_available == 0:
+    n_avail = len(CAT)
+    if n_avail == 0:
         return []
-    n_items = random.randint(min(min_items, n_available),
-                             min(max_items, n_available))
-    picks = CATALOG.sample(n=n_items, replace=False)
+    n_items = random.randint(min(min_items, n_avail),
+                             min(max_items, n_avail))
+    picks = CAT.sample(n=n_items, replace=False)
     return [
         dict(itemid=int(r.itemid),
              quantity=random.randint(min_qty, max_qty),
@@ -104,7 +100,7 @@ def random_cart() -> list[dict]:
         for _, r in picks.iterrows()
     ]
 
-def base_interval(sim_dt: datetime) -> float:
+def base_interval(sim_dt: datetime) -> float:           # seconds
     if PROFILE.startswith("Standard"):
         return 120.0
     h = sim_dt.hour
@@ -114,27 +110,42 @@ def base_interval(sim_dt: datetime) -> float:
     if 18 <= h < 22: return  40
     return 240
 
-def next_interval(sim_dt: datetime) -> float:
-    """Each cashier is an independent sale generator."""
-    return base_interval(sim_dt) / (SPEED * CASHIERS)   # ← FIX
+def next_gap(sim_dt: datetime) -> float:
+    """Gap *per cashier* (global rate multiplies by CASHIERS)."""
+    return base_interval(sim_dt) / SPEED
 
-# ─────────────── Inventory helpers ───────────────
+def process_sale(cashier_idx: int, sim_dt: datetime):
+    cart = random_cart()
+    if not cart:
+        return
+    cid = f"CASH{cashier_idx+1:02d}"
+    try:
+        saleid, _ = POS.process_sale_with_shortage(
+            cart_items=cart,
+            discount_rate=0.0,
+            payment_method="Cash",
+            cashier=cid,
+            notes=f"[SIM {sim_dt:%F %T}]",
+        )
+        if saleid:
+            st.session_state.sales_count += 1
+    except Exception:
+        POS.conn.rollback()
+
+# ───────────── INVENTORY & SHELF CYCLES (unchanged) ─────────────
 def inventory_cycle() -> int:
     snap = INV.stock_levels()
     below = snap[snap.totalqty < snap.threshold].copy()
     if below.empty:
         return 0
     below["need"] = below["average"] - below["totalqty"]
-    log = INV.restock_items_bulk(below[["itemid", "need", "sellingprice"]])
-    return len(log)
+    return len(INV.restock_items_bulk(below[["itemid", "need", "sellingprice"]]))
 
-# ─────────────── Shelf helpers ───────────────
 def shelf_cycle() -> int:
     meta = SHELF.get_all_items().set_index("itemid")
     kpi  = SHELF.get_shelf_quantity_by_item().set_index("itemid")
     df   = meta.join(kpi, how="left").fillna({"totalquantity": 0})
     df["totalquantity"] = df.totalquantity.astype(int)
-
     below = df[df.totalquantity < df.shelfthreshold]
     moved = 0
     for itemid, row in below.iterrows():
@@ -177,75 +188,51 @@ def shelf_cycle() -> int:
             )
     return moved
 
-# ─────────────── POS helpers ───────────────
-def process_one_sale(sim_dt: datetime):
-    cart = random_cart()
-    if not cart:
-        return
-    cashier_id = f"CASH{random.randint(1, CASHIERS):02d}"
-    try:
-        saleid, _ = POS.process_sale_with_shortage(
-            cart_items     = cart,
-            discount_rate  = 0.0,
-            payment_method = "Cash",
-            cashier        = cashier_id,
-            notes          = f"[SIM {sim_dt:%F %T}]",
-        )
-        if saleid:
-            st.session_state.sales_count += 1
-    except Exception:
-        POS.conn.rollback()
-
-# ─────────────── MAIN LOOP ───────────────
+# ───────────── MAIN LOOP ─────────────
 if RUN:
     now_real = time.time()
     elapsed  = now_real - st.session_state.real_ts
     st.session_state.real_ts = now_real
-
-    # advance simulated clock
     st.session_state.sim_clock += timedelta(seconds=elapsed * SPEED)
 
-    # generate due sales
-    while st.session_state.next_sale_sim_ts <= st.session_state.sim_clock:
-        process_one_sale(st.session_state.next_sale_sim_ts)
-        gap = timedelta(seconds=next_interval(st.session_state.next_sale_sim_ts))
-        st.session_state.next_sale_sim_ts += gap
+    # ----- PER‑CASHIER SCHEDULING -----
+    for idx, nxt in enumerate(st.session_state.next_sale_times):
+        while nxt <= st.session_state.sim_clock:
+            process_sale(idx, nxt)
+            nxt += timedelta(seconds=next_gap(nxt))
+        st.session_state.next_sale_times[idx] = nxt  # update back
 
-    # inventory refill
+    # ----- INVENTORY REFILL -----
     if now_real - st.session_state.inv_last_ts >= INV_SEC:
         try:
-            rows = inventory_cycle()
-            st.session_state.last_inv_rows = rows
+            st.session_state.last_inv_rows = inventory_cycle()
             st.session_state.inv_cycles   += 1
         except Exception:
             st.error("Inventory error:\n" +
                      "".join(traceback.format_exc(limit=1)))
         st.session_state.inv_last_ts = now_real
 
-    # shelf refill
+    # ----- SHELF REFILL -----
     if now_real - st.session_state.sh_last_ts >= SHELF_SEC:
         try:
-            moved = shelf_cycle()
-            st.session_state.last_sh_rows = moved
+            st.session_state.last_sh_rows = shelf_cycle()
             st.session_state.sh_cycles   += 1
         except Exception:
             st.error("Shelf error:\n" +
                      "".join(traceback.format_exc(limit=1)))
         st.session_state.sh_last_ts = now_real
 
-    # ─────────── metrics ───────────
+    # ─────────── METRICS ───────────
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("POS")
         st.metric("Total sales", st.session_state.sales_count)
-        st.metric("Sim time",
-                  f"{st.session_state.sim_clock:%F %T}")
+        st.metric("Sim time", f"{st.session_state.sim_clock:%F %T}")
     with col2:
         st.subheader("Automation")
         st.metric("Inv rows last",   st.session_state.last_inv_rows)
         st.metric("Shelf qty moved", st.session_state.last_sh_rows)
 
-    # progress bars
     st.progress((now_real - st.session_state.inv_last_ts) / INV_SEC,
                 text="Inventory cycle progress")
     st.progress((now_real - st.session_state.sh_last_ts) / SHELF_SEC,
@@ -254,4 +241,4 @@ if RUN:
     time.sleep(0.2)
     st.rerun()
 else:
-    st.info("Fill parameters, then press **Start** to launch all processes.")
+    st.info("Set parameters and press **Start** to launch all processes.")
