@@ -1,21 +1,23 @@
 """
-SellingAreaHandler  –  full version
-===================================
-•  Keeps resolve_shortages() and restock_item() from earlier drafts.
-•  Upsert key on shelf = (itemid, expirationdate, locid, cost_per_unit).
+SellingAreaHandler – fast bulk shelf refill
 """
 
 from __future__ import annotations
 from datetime import date
+from functools import lru_cache
+from typing import List, Tuple
+
 import pandas as pd
 from psycopg2.extras import execute_values
+
 from db_handler import DatabaseManager
 
 __all__ = ["SellingAreaHandler"]
 
 
 class SellingAreaHandler(DatabaseManager):
-    # ───────────────────── private helpers ─────────────────────
+    # ───────────── small helpers ─────────────
+    @lru_cache(maxsize=10_000)            # ← slot mapping cache
     def _lookup_locid(self, itemid: int) -> str | None:
         df = self.fetch_data(
             "SELECT locid FROM item_slot WHERE itemid = %s LIMIT 1", (itemid,)
@@ -37,10 +39,11 @@ class SellingAreaHandler(DatabaseManager):
             """
             INSERT INTO shelf
                   (itemid, expirationdate, quantity, cost_per_unit, locid)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (%s,%s,%s,%s,%s)
             ON CONFLICT (itemid, expirationdate, locid, cost_per_unit)
-            DO UPDATE SET quantity    = shelf.quantity + EXCLUDED.quantity,
-                          lastupdated = CURRENT_TIMESTAMP;
+            DO UPDATE
+               SET quantity    = shelf.quantity + EXCLUDED.quantity,
+                   lastupdated = CURRENT_TIMESTAMP
             """,
             (itemid, expirationdate, quantity, cost_per_unit, locid),
         )
@@ -48,12 +51,12 @@ class SellingAreaHandler(DatabaseManager):
             """
             INSERT INTO shelfentries
                   (itemid, expirationdate, quantity, createdby, locid)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (%s,%s,%s,%s,%s)
             """,
             (itemid, expirationdate, quantity, created_by, locid),
         )
 
-    # ───────────────────── inventory → shelf ─────────────────────
+    # ───────────── inventory → shelf ─────────────
     def transfer_from_inventory(
         self,
         *,
@@ -96,45 +99,37 @@ class SellingAreaHandler(DatabaseManager):
                     created_by=created_by,
                 )
 
-    # ───────────────────── public look‑ups (unchanged) ─────────────────────
+    # ───────────── public look‑ups ─────────────
     def get_all_items(self) -> pd.DataFrame:
         df = self.fetch_data(
             """
             SELECT itemid,
                    itemnameenglish AS itemname,
-                   shelfthreshold,
-                   shelfaverage
+                   COALESCE(shelfthreshold,0) AS shelfthreshold,
+                   COALESCE(shelfaverage, shelfthreshold, 0) AS shelfaverage
               FROM item
-          ORDER BY itemnameenglish;
+          ORDER BY itemnameenglish
             """
         )
         if not df.empty:
-            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
-            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
+            df[["shelfthreshold", "shelfaverage"]] = df[
+                ["shelfthreshold", "shelfaverage"]
+            ].astype(int)
         return df
 
     def get_shelf_quantity_by_item(self) -> pd.DataFrame:
         df = self.fetch_data(
             """
             SELECT i.itemid,
-                   i.itemnameenglish AS itemname,
-                   COALESCE(SUM(s.quantity),0) AS totalquantity,
-                   i.shelfthreshold,
-                   i.shelfaverage
+                   COALESCE(SUM(s.quantity),0)::int AS totalquantity
               FROM item i
          LEFT JOIN shelf s ON s.itemid = i.itemid
-          GROUP BY i.itemid,i.itemnameenglish,
-                   i.shelfthreshold,i.shelfaverage
-          ORDER BY i.itemnameenglish;
+          GROUP BY i.itemid
             """
         )
-        if not df.empty:
-            df["totalquantity"]  = df["totalquantity"].astype(int)
-            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
-            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
         return df
 
-    # ───────── shortage resolver (unchanged) ─────────
+    # ───────────── shortage resolver (unchanged) ─────────────
     def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
         rows = self.fetch_data(
             """
