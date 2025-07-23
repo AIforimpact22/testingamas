@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-🗄️ Shelf Auto‑Refill – Fast, Only For Items Below Threshold
+🗄️ Shelf Auto‑Refill – Optimized and Fixed (no circular import)
 """
 
 import time
@@ -10,7 +10,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from handler.selling_area_handler import SellingAreaHandler
+from handler.selling_area_handler import SellingAreaHandler  # Only import here!
 
 # ─────────── UI basics ───────────
 st.set_page_config(page_title="Shelf Auto‑Refill", page_icon="🗄️")
@@ -46,7 +46,7 @@ handler = SellingAreaHandler()
 USER = "AUTO‑SHELF"
 DUMMY_SALEID = 0     # unchanged
 
-# ─────────── ONLY items below threshold, direct SQL ───────────
+# ─────────── Only items below threshold ───────────
 def get_items_below_shelfthreshold(handler) -> pd.DataFrame:
     """
     Returns only items whose current shelf quantity is below their threshold.
