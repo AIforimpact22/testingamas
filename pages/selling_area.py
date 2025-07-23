@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-🗄️ Shelf Auto‑Refill – Optimized, Progress & Refilled Tab
+🗄️ Shelf Auto‑Refill – Optimized, Progress & Refilled Tab, with End-of-Run Notification
 """
 
 import time
@@ -30,6 +30,7 @@ st.session_state.setdefault("cycles", 0)
 st.session_state.setdefault("last_log", [])
 st.session_state.setdefault("history_log", [])    # for full log history
 st.session_state.setdefault("refilled_log", [])   # for successful refills only
+st.session_state.setdefault("last_refilled_count", 0)  # to show end-of-run status
 
 # start/stop
 c1, c2 = st.columns(2)
@@ -39,7 +40,8 @@ if c1.button("▶ Start", disabled=st.session_state.running):
                             cycles=0,
                             last_log=[],
                             history_log=[],
-                            refilled_log=[])
+                            refilled_log=[],
+                            last_refilled_count=0)
 if c2.button("⏹ Stop", disabled=not st.session_state.running):
     st.session_state.running = False
 
@@ -55,8 +57,9 @@ def refill_item(
     current_qty: int,
     meta,
 ) -> str:
-    threshold = getattr(meta, "shelfthreshold", meta["shelfthreshold"])
-    average   = getattr(meta, "shelfaverage", meta["shelfaverage"])
+    # Fixed: meta is always a namedtuple from itertuples(), use attributes only!
+    threshold = meta.shelfthreshold
+    average   = meta.shelfaverage
     if current_qty >= threshold:
         return "OK"
 
@@ -105,6 +108,7 @@ def run_cycle() -> list[dict]:
     below = handler.get_items_below_shelfthreshold()
     if below.empty:
         st.info("Nothing to refill this cycle.")
+        st.session_state.last_refilled_count = 0
         return []
 
     log: list[dict] = []
@@ -143,18 +147,27 @@ def run_cycle() -> list[dict]:
     # Add to session_state
     if refilled:
         st.session_state.refilled_log.extend(refilled)
+    st.session_state.last_refilled_count = len(refilled)
     return log
 
 # ─────────── main loop ───────────
 if st.session_state.running:
     now = time.time()
     rem = SECONDS - (now - st.session_state.last_ts)
+    notify_placeholder = st.empty()
     if rem <= 0:
         try:
             log = run_cycle()
             st.session_state.last_log = log
             if log:
                 st.session_state.history_log.extend(log)
+            # After each run, show a notification with the refill results
+            refilled_count = st.session_state.last_refilled_count
+            if refilled_count > 0:
+                notify_placeholder.success(f"Cycle complete! {refilled_count} item(s) refilled/updated this run.")
+            else:
+                notify_placeholder.info("Cycle complete! No items needed refilling this run.")
+            time.sleep(2.0)  # Show notification briefly before rerun
         except Exception as exc:
             st.error("⛔ " + "".join(traceback.format_exception_only(type(exc), exc)))
             st.session_state.running = False
