@@ -1,6 +1,5 @@
-# pages/inventory.py
 """
-📦 Inventory Auto‑Refill – with live debug view
+📦 Inventory Auto‑Refill – with live debug view and supplier batch progress
 """
 
 from __future__ import annotations
@@ -22,8 +21,10 @@ INTERVAL = value * {"Seconds": 1, "Minutes": 60, "Hours": 3600}[unit]
 DEBUG_MODE = st.sidebar.checkbox("🔍 Debug mode")
 
 # ───────── session state ─────────
-defaults = dict(inv_run=False, last_ts=0.0, cycles=0,
-                last_log=[], all_logs=[])
+defaults = dict(
+    inv_run=False, last_ts=0.0, cycles=0,
+    last_log=[], all_logs=[], supplier_logs=[]
+)
 for k, v in defaults.items():
     st.session_state.setdefault(k, v)
 
@@ -45,7 +46,6 @@ def one_cycle() -> dict:
     if below.empty:
         return {"log": [], "by_supplier": {}}
 
-    # safe target when average is 0 / NULL
     below["target"] = below[["average", "threshold"]].max(axis=1)
     below["need"]   = below["target"] - below["totalqty"]
     below = below[below.need > 0]
@@ -54,15 +54,38 @@ def one_cycle() -> dict:
         st.subheader("Below threshold")
         st.dataframe(below, height=300, use_container_width=True)
 
-    return inv.restock_items_bulk(
-        below[["itemid", "need", "sellingprice"]], debug=DEBUG_MODE
-    )
+    # ----------- LIVE SUPPLIER PROGRESS -----------
+    log: list = []
+    supplier_logs = []
+    total_suppliers = below["itemid"].apply(inv.supplier_for).nunique()
+    suppliers_seen = 0
+
+    df_need = below[["itemid", "need", "sellingprice"]]
+    df_need["supplier"] = df_need["itemid"].apply(inv.supplier_for)
+
+    for sup_id, grp in df_need.groupby("supplier"):
+        suppliers_seen += 1
+        st.info(f"Restocking for supplier {sup_id} ({suppliers_seen}/{total_suppliers})...")
+        result = inv.restock_items_bulk(grp, debug=DEBUG_MODE)
+        log.extend(result["log"])
+        supplier_logs.append({
+            "supplier_id": sup_id,
+            "df": grp.copy(),
+            "count": len(grp),
+        })
+        st.progress(suppliers_seen / total_suppliers, text=f"Suppliers processed: {suppliers_seen}/{total_suppliers}")
+        if DEBUG_MODE:
+            with st.expander(f"Supplier {sup_id} – {len(grp)} rows"):
+                st.dataframe(grp, use_container_width=True)
+        time.sleep(0.2)
+
+    return {"log": log, "by_supplier": supplier_logs}
 
 # ───────── start / stop ─────────
 col_start, col_stop = st.columns(2)
 if col_start.button("▶ Start", disabled=st.session_state.inv_run):
     st.session_state.update(inv_run=True, last_ts=0.0,
-                            cycles=0, last_log=[], all_logs=[])
+                            cycles=0, last_log=[], all_logs=[], supplier_logs=[])
 if col_stop.button("⏹ Stop", disabled=not st.session_state.inv_run):
     st.session_state.inv_run = False
 
@@ -74,22 +97,19 @@ if st.session_state.inv_run:
     if remaining == 0:
         try:
             result = one_cycle()
-        except Exception as exc:            # surface any SQL / lock errors
+            st.session_state.last_log = result["log"]
+            st.session_state.all_logs.extend(result["log"])
+            st.session_state.supplier_logs.extend(result.get("by_supplier", []))
+            st.success(f"Cycle complete! {len(result['log'])} items restocked in this run.")
+            time.sleep(2.0)
+        except Exception as exc:
             st.error(f"⛔ {exc!s}")
             st.session_state.inv_run = False
             st.stop()
 
         st.session_state.last_ts = time.time()
         st.session_state.cycles += 1
-        st.session_state.last_log = result["log"]
-        st.session_state.all_logs.extend(result["log"])
         remaining = INTERVAL
-
-        if DEBUG_MODE and result["by_supplier"]:
-            st.subheader("Refill groups (per supplier)")
-            for sup, df_sup in result["by_supplier"].items():
-                with st.expander(f"Supplier {sup} – {len(df_sup)} rows"):
-                    st.dataframe(df_sup, use_container_width=True)
 
     # ── metrics ──
     c1, c2, c3 = st.columns(3)
@@ -101,12 +121,13 @@ if st.session_state.inv_run:
         if st.session_state.last_ts else "—",
     )
 
-    # ── progress bar ──
     st.progress(1.0 - remaining / INTERVAL,
                 text=f"Next cycle in {int(remaining)} s")
 
-    # ── last‑cycle log ──
-    with st.expander("Last cycle log", expanded=False):
+    # Tabs for logs and per-supplier views
+    tab1, tab2, tab3 = st.tabs(["Last Cycle Log", "All Cycles (History)", "Supplier Batches"])
+    with tab1:
+        st.subheader("Last cycle log")
         if st.session_state.last_log:
             st.dataframe(
                 pd.DataFrame(st.session_state.last_log),
@@ -114,6 +135,25 @@ if st.session_state.inv_run:
             )
         else:
             st.write("Nothing added last cycle.")
+
+    with tab2:
+        st.subheader("All logs (history)")
+        if st.session_state.all_logs:
+            st.dataframe(
+                pd.DataFrame(st.session_state.all_logs),
+                use_container_width=True,
+            )
+        else:
+            st.write("No refill actions yet.")
+
+    with tab3:
+        st.subheader("Batches by Supplier")
+        if st.session_state.supplier_logs:
+            for entry in st.session_state.supplier_logs[-10:]:
+                with st.expander(f"Supplier {entry['supplier_id']} – {entry['count']} items"):
+                    st.dataframe(entry["df"], use_container_width=True)
+        else:
+            st.write("No supplier batches yet.")
 
     time.sleep(0.1)
     st.rerun()
