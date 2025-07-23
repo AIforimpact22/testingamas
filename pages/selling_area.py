@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-🗄️ Shelf Auto‑Refill – with Live Per-Item Progress Tracking
+🗄️ Shelf Auto‑Refill – Optimized, UI/Streamlit only (no handler code here)
 """
 
 import time
@@ -10,7 +10,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from handler.selling_area_handler import SellingAreaHandler  # Only import here!
+from handler.selling_area_handler import SellingAreaHandler
 
 # ─────────── UI basics ───────────
 st.set_page_config(page_title="Shelf Auto‑Refill", page_icon="🗄️")
@@ -46,20 +46,15 @@ handler = SellingAreaHandler()
 USER = "AUTO‑SHELF"
 DUMMY_SALEID = 0     # unchanged
 
-# ─────────── cached static meta ───────────
-@st.cache_data(ttl=600, show_spinner=False)
-def load_item_meta() -> pd.DataFrame:
-    return handler.get_all_items().set_index("itemid")
-
-# ─────────── refilled‑per‑item function ───────────
+# ─────────── refill logic, optimized ───────────
 def refill_item(
     *,
     itemid: int,
     current_qty: int,
-    meta: pd.Series,
+    meta,
 ) -> str:
-    threshold = meta.shelfthreshold
-    average   = meta.shelfaverage
+    threshold = getattr(meta, "shelfthreshold", meta["shelfthreshold"])
+    average   = getattr(meta, "shelfaverage", meta["shelfaverage"])
     if current_qty >= threshold:
         return "OK"
 
@@ -103,36 +98,23 @@ def refill_item(
     )
     return f"Partial (short {need})"
 
-# ─────────── one full cycle WITH LIVE PROGRESS ───────────
+# ─────────── main refill cycle ───────────
 def run_cycle() -> list[dict]:
-    meta_df = load_item_meta()
-    qty_df  = handler.get_shelf_quantity_by_item().set_index("itemid")
-    merged  = meta_df.join(qty_df, how="left").fillna({"totalquantity": 0})
-    merged["totalquantity"] = merged.totalquantity.astype(int)
-
-    below = merged[merged.totalquantity < merged.shelfthreshold]
-
-    if DEBUG:
-        st.subheader("Merged snapshot")
-        st.dataframe(merged, use_container_width=True)
-        st.subheader("Below threshold")
-        st.dataframe(below, use_container_width=True)
+    below = handler.get_items_below_shelfthreshold()
+    if below.empty:
+        st.info("Nothing to refill this cycle.")
+        return []
 
     log: list[dict] = []
     n = len(below)
-    if n == 0:
-        st.info("Nothing to refill this cycle.")
-        return log
-
-    # Live progress display
     item_progress = st.empty()
     step_bar = st.progress(0, text="Processing items...")
 
-    for i, (itemid, row) in enumerate(below.iterrows(), 1):
+    for i, row in enumerate(below.itertuples(index=False), 1):
         item_progress.info(f"Processing: **{row.itemname}** ({i} of {n})")
         try:
             action = refill_item(
-                itemid=itemid,
+                itemid=row.itemid,
                 current_qty=row.totalquantity,
                 meta=row,
             )
@@ -143,8 +125,7 @@ def run_cycle() -> list[dict]:
         log.append({"item": row.itemname, "action": action})
         step_bar.progress(i / n, text=f"Processed {i}/{n}")
         if DEBUG:
-            time.sleep(0.15)  # makes progress visible if items process instantly
-
+            time.sleep(0.15)
     item_progress.success("Cycle complete!")
     step_bar.progress(1.0, text="Done.")
 
