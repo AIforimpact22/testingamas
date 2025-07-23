@@ -97,48 +97,56 @@ class SellingAreaHandler(DatabaseManager):
         if not picks:
             return 0
 
-        with self.conn:
-            with self.conn.cursor() as cur:
-                # 1️⃣ decrement inventory in bulk
-                execute_values(
-                    cur,
-                    """
-                    UPDATE inventory AS inv
-                       SET quantity = inv.quantity - v.take_qty
-                      FROM (VALUES %s)
-                           AS v(itemid,exp,cpu,take_qty,locid)
-                     WHERE inv.itemid         = v.itemid
-                       AND inv.expirationdate = v.exp
-                       AND inv.cost_per_unit  = v.cpu
-                    """,
-                    picks,
-                )
+        self._ensure_live_conn()                         # make sure conn is open
+        cur = self.conn.cursor()                         # ➊ one cursor, no
+        try:                                             #    outer `with self.conn:`
+            # 1️⃣ decrement inventory
+            execute_values(
+                cur,
+                """
+                UPDATE inventory AS inv
+                   SET quantity = inv.quantity - v.take_qty
+                  FROM (VALUES %s)
+                       AS v(itemid,exp,cpu,take_qty,locid)
+                 WHERE inv.itemid         = v.itemid
+                   AND inv.expirationdate = v.exp
+                   AND inv.cost_per_unit  = v.cpu
+                """,
+                picks,
+            )
 
-                # 2️⃣ upsert to shelf
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO shelf
-                          (itemid, expirationdate, cost_per_unit,
-                           quantity, locid)
-                    VALUES %s
-                    ON CONFLICT (itemid, expirationdate,
-                                 cost_per_unit, locid)
-                    DO UPDATE SET quantity    = shelf.quantity + EXCLUDED.quantity,
-                                  lastupdated = CURRENT_TIMESTAMP
-                    """,
-                    [(p[0], p[1], p[2], p[3], p[4]) for p in picks],
-                )
+            # 2️⃣ upsert to shelf
+            execute_values(
+                cur,
+                """
+                INSERT INTO shelf
+                      (itemid, expirationdate, cost_per_unit,
+                       quantity, locid)
+                VALUES %s
+                ON CONFLICT (itemid, expirationdate,
+                             cost_per_unit, locid)
+                DO UPDATE SET quantity    = shelf.quantity + EXCLUDED.quantity,
+                              lastupdated = CURRENT_TIMESTAMP
+                """,
+                [(p[0], p[1], p[2], p[3], p[4]) for p in picks],
+            )
 
-                # 3️⃣ audit into shelfentries
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO shelfentries
-                          (itemid, expirationdate, quantity, createdby, locid)
-                    VALUES %s
-                    """,
-                    [(p[0], p[1], p[3], user, p[4]) for p in picks],
-                )
+            # 3️⃣ audit into shelfentries
+            execute_values(
+                cur,
+                """
+                INSERT INTO shelfentries
+                      (itemid, expirationdate, quantity, createdby, locid)
+                VALUES %s
+                """,
+                [(p[0], p[1], p[3], user, p[4]) for p in picks],
+            )
+
+            self.conn.commit()           # ➋ explicit commit
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            cur.close()
 
         return len(picks)
