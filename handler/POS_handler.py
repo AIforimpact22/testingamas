@@ -4,20 +4,16 @@ POS_handler
 ───────────
 Database helpers used by the live POS simulator.
 
-Responsibilities
-• Create `sales` header rows and `salesitems` detail rows.
-• Deduct quantities from the *shelf* and log shortages when shelf stock
-  cannot cover the requested quantity.
-• **Always record the customer's full basket** in `salesitems` and the
-  header totals, even if some units are back‑ordered (shortage).
-  Those shortages are later cleared by the Shelf‑refill loop.
-
-⚠️  Shelf auto‑refill lives elsewhere; this handler only writes shortages.
+New in this version
+───────────────────
+• process_sales_batch()  → bulk‑insert N sales in ONE shot
+  (headers, salesitems, shortages, header‑totals update).
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import List, Dict, Any
 
 import pandas as pd
@@ -31,7 +27,7 @@ from db_handler import DatabaseManager
 # --------------------------------------------------------------------------- #
 class POSHandler(DatabaseManager):
     # ─────────────────────────── sale header ────────────────────────────
-    def create_sale_record(
+    def create_sale_record(   # unchanged – still useful outside the batch API
         self,
         *,
         total_amount: float,
@@ -66,160 +62,183 @@ class POSHandler(DatabaseManager):
         )
         return int(res[0]) if res else None
 
-    # ───────────────────── line‑items (batch insert) ────────────────────
-    def add_sale_items(self, saleid: int, items: List[Dict[str, Any]]) -> None:
-        if not items:
-            return
-        rows = [
-            (
-                saleid,
-                int(it["itemid"]),
-                int(it["quantity"]),
-                float(it["unitprice"]),
-                float(it["totalprice"]),
-            )
-            for it in items
-            if it["quantity"] > 0          # skip zero‑qty edge cases
-        ]
-        if not rows:
-            return
-
-        sql = """
-            INSERT INTO salesitems
-                  (saleid, itemid, quantity, unitprice, totalprice)
-            VALUES %s
-        """
-        self._ensure_live_conn()
-        with self.conn.cursor() as cur:
-            execute_values(cur, sql, rows)
-        self.conn.commit()
-
-    # ───────────────────── shelf stock helpers ──────────────────────────
-    def _deduct_from_shelf(self, itemid: int, qty_needed: int) -> int:
-        """
-        Consume quantity from the oldest shelf layers (FIFO).
-        Returns remaining qty that could **not** be fulfilled (shortage).
-        """
-        remaining = qty_needed
-        layers = self.fetch_data(
-            """
-            SELECT shelfid, quantity
-            FROM   shelf
-            WHERE  itemid = %s AND quantity > 0
-            ORDER  BY expirationdate
-            """,
-            (itemid,),
-        )
-
-        for lyr in layers.itertuples():
-            if remaining == 0:
-                break
-
-            if remaining >= lyr.quantity:
-                # take whole layer and delete
-                self.execute_command("DELETE FROM shelf WHERE shelfid = %s",
-                                     (lyr.shelfid,))
-                remaining -= lyr.quantity
-            else:
-                # partial take
-                self.execute_command(
-                    "UPDATE shelf SET quantity = quantity - %s "
-                    "WHERE shelfid = %s",
-                    (remaining, lyr.shelfid),
-                )
-                remaining = 0
-
-        return remaining  # >0 means shortage
-
-    # ─────────────── main POS commit (shortage‑aware) ───────────────────
-    def process_sale_with_shortage(
+    # ───────────────────── NEW: bulk sales processing ────────────────────
+    def process_sales_batch(
         self,
-        *,
-        cart_items: List[Dict[str, Any]],
-        discount_rate: float,
-        payment_method: str,
-        cashier: str,
-        notes: str = "",
-    ):
+        sales: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
         """
-        • Inserts a `sales` header (placeholder totals first).
-        • Deducts what is available from shelf; logs any shortage rows.
-        • ALWAYS records the requested quantity in `salesitems`.
-        • Updates header totals so they match the till receipt even when
-          shortages occur.
+        Bulk‑process *multiple* baskets in ONE DB transaction.
+
+        Parameters
+        ----------
+        sales : list[dict]
+            [
+              {
+                "cashier":        "CASH01",
+                "cart_items":     [ {itemid, quantity, sellingprice, itemname}, … ],
+                "discount_rate":  0.0,
+                "payment_method": "Cash",
+                "notes":          "...",
+              },
+              …
+            ]
 
         Returns
         -------
-        (saleid, shortages_list)
-            shortages_list = [{"itemname": str, "qty": int}, …]
+        list[dict]
+            Same schema the UI used before for its debug log:
+              {"saleid", "cashier", "timestamp", "items", "shortages"}
         """
-        saleid = self.create_sale_record(
-            total_amount   = 0,
-            discount_rate  = discount_rate,
-            total_discount = 0,
-            final_amount   = 0,
-            payment_method = payment_method,
-            cashier        = cashier,
-            notes          = notes,
-        )
-        if saleid is None:
-            return None, []
+        if not sales:
+            return []
 
-        shortages: list[dict] = []
-        lines: List[Dict[str, Any]] = []
-        running_total = 0.0
+        self._ensure_live_conn()
+        log_out: list[dict] = []
+        ts_now = datetime.now().strftime("%F %T")
 
-        for it in cart_items:
-            iid      = int(it["itemid"])
-            req_qty  = int(it["quantity"])
-            price    = float(it["sellingprice"])
+        with self.conn.cursor() as cur:
+            # -----------------------------------------------------------------
+            # 1) Insert header placeholders → grab all saleids
+            # -----------------------------------------------------------------
+            header_rows = [
+                (0.0, s["discount_rate"], 0.0, 0.0, s["payment_method"],
+                 s["cashier"], s.get("notes", ""), None)
+                for s in sales
+            ]
+            header_sql = """
+                INSERT INTO sales (
+                    totalamount, discountrate, totaldiscount, finalamount,
+                    paymentmethod, cashier, notes, original_saleid
+                )
+                VALUES %s
+                RETURNING saleid
+            """
+            saleids = [row[0] for row in
+                       execute_values(cur, header_sql, header_rows, fetch=True)]
 
-            # try to fulfil from shelf
-            shortage_qty = self._deduct_from_shelf(iid, req_qty)
+            # -----------------------------------------------------------------
+            # 2) Build rows for salesitems, shortages, header‑totals
+            # -----------------------------------------------------------------
+            items_rows:     list[tuple] = []
+            shortage_rows:  list[tuple] = []
+            header_updates: list[tuple] = []   # total, disc, final, saleid
 
-            # log shortage row if needed
-            if shortage_qty > 0:
-                self.execute_command(
+            for sid, sale in zip(saleids, sales):
+                running_total = 0.0
+                local_items:    list[dict] = []
+                local_shortages: list[dict] = []
+
+                for it in sale["cart_items"]:
+                    iid     = int(it["itemid"])
+                    req_qty = int(it["quantity"])
+                    price   = float(it["sellingprice"])
+
+                    # ---------- FIFO depletion WITHOUT per‑row commits ----------
+                    remaining = req_qty
+                    cur.execute(
+                        """
+                        SELECT shelfid, quantity
+                          FROM shelf
+                         WHERE itemid = %s AND quantity > 0
+                      ORDER BY expirationdate
+                        """,
+                        (iid,),
+                    )
+                    for shelfid, qty in cur.fetchall():
+                        if remaining == 0:
+                            break
+                        if remaining >= qty:
+                            cur.execute("DELETE FROM shelf WHERE shelfid=%s",
+                                        (shelfid,))
+                            remaining -= qty
+                        else:
+                            cur.execute(
+                                "UPDATE shelf SET quantity = quantity - %s "
+                                "WHERE shelfid = %s",
+                                (remaining, shelfid),
+                            )
+                            remaining = 0
+
+                    # -------- record line‑item (full requested qty) -------------
+                    tot_price = round(req_qty * price, 2)
+                    items_rows.append(
+                        (sid, iid, req_qty, price, tot_price)
+                    )
+                    local_items.append(
+                        dict(itemid=iid,
+                             itemname=it.get("itemname"),
+                             quantity=req_qty,
+                             unitprice=price,
+                             totalprice=tot_price)
+                    )
+                    running_total += req_qty * price
+
+                    # -------- shortage row (if any) ------------------------------
+                    if remaining > 0:
+                        shortage_rows.append((sid, iid, remaining))
+                        name = self.fetch_data(
+                            "SELECT itemnameenglish FROM item WHERE itemid=%s",
+                            (iid,),
+                        ).iat[0, 0]
+                        local_shortages.append(
+                            {"itemname": name, "qty": remaining}
+                        )
+
+                disc  = round(running_total * sale["discount_rate"] / 100, 2)
+                final = running_total - disc
+                header_updates.append((running_total, disc, final, sid))
+
+                log_out.append(
+                    {
+                        "saleid":    sid,
+                        "cashier":   sale["cashier"],
+                        "timestamp": ts_now,
+                        "items":     local_items,
+                        "shortages": local_shortages,
+                    }
+                )
+
+            # -----------------------------------------------------------------
+            # 3) Bulk insert detail & shortage rows
+            # -----------------------------------------------------------------
+            execute_values(
+                cur,
+                """
+                INSERT INTO salesitems
+                      (saleid, itemid, quantity, unitprice, totalprice)
+                VALUES %s
+                """,
+                items_rows,
+            )
+
+            if shortage_rows:
+                execute_values(
+                    cur,
                     """
                     INSERT INTO shelf_shortage (saleid, itemid, shortage_qty)
-                    VALUES (%s,%s,%s)
+                    VALUES %s
                     """,
-                    (saleid, iid, shortage_qty),
+                    shortage_rows,
                 )
-                name = self.fetch_data(
-                    "SELECT itemnameenglish FROM item WHERE itemid=%s", (iid,)
-                ).iat[0, 0]
-                shortages.append({"itemname": name, "qty": shortage_qty})
 
-            # always record the full requested quantity in the receipt
-            lines.append(
-                dict(
-                    itemid     = iid,
-                    quantity   = req_qty,
-                    unitprice  = price,
-                    totalprice = round(req_qty * price, 2),
-                )
+            # -----------------------------------------------------------------
+            # 4) Bulk‑update header totals
+            # -----------------------------------------------------------------
+            cur.executemany(
+                """
+                UPDATE sales
+                   SET totalamount   = %s,
+                       totaldiscount = %s,
+                       finalamount   = %s
+                 WHERE saleid = %s
+                """,
+                header_updates,
             )
-            running_total += req_qty * price
 
-        # batch insert all line‑items
-        self.add_sale_items(saleid, lines)
+            self.conn.commit()
 
-        # update header totals
-        total_disc = round(running_total * discount_rate / 100, 2)
-        final_amt  = running_total - total_disc
-        self.execute_command(
-            """
-            UPDATE sales
-               SET totalamount   = %s,
-                   totaldiscount = %s,
-                   finalamount   = %s
-             WHERE saleid = %s
-            """,
-            (running_total, total_disc, final_amt, saleid),
-        )
-
-        return saleid, shortages
+        return log_out
 
     # ───────────────────── simple reporting helpers ────────────────────
     def get_sale_details(self, saleid: int):
