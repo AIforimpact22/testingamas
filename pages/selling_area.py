@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-🗄️ Shelf Auto‑Refill – refactored with Debug mode
+🗄️ Shelf Auto‑Refill – with Live Per-Item Progress Tracking
 """
 
 import time
@@ -28,6 +28,7 @@ st.session_state.setdefault("running", False)
 st.session_state.setdefault("last_ts", 0.0)
 st.session_state.setdefault("cycles", 0)
 st.session_state.setdefault("last_log", [])
+st.session_state.setdefault("history_log", [])   # for full log history
 
 # start/stop
 c1, c2 = st.columns(2)
@@ -35,7 +36,8 @@ if c1.button("▶ Start", disabled=st.session_state.running):
     st.session_state.update(running=True,
                             last_ts=time.time() - SECONDS,
                             cycles=0,
-                            last_log=[])
+                            last_log=[],
+                            history_log=[])
 if c2.button("⏹ Stop", disabled=not st.session_state.running):
     st.session_state.running = False
 
@@ -101,7 +103,7 @@ def refill_item(
     )
     return f"Partial (short {need})"
 
-# ─────────── one full cycle ───────────
+# ─────────── one full cycle WITH LIVE PROGRESS ───────────
 def run_cycle() -> list[dict]:
     meta_df = load_item_meta()
     qty_df  = handler.get_shelf_quantity_by_item().set_index("itemid")
@@ -117,13 +119,35 @@ def run_cycle() -> list[dict]:
         st.dataframe(below, use_container_width=True)
 
     log: list[dict] = []
-    for itemid, row in below.iterrows():
-        action = refill_item(
-            itemid=itemid,
-            current_qty=row.totalquantity,
-            meta=row,
-        )
+    n = len(below)
+    if n == 0:
+        st.info("Nothing to refill this cycle.")
+        return log
+
+    # Live progress display
+    item_progress = st.empty()
+    step_bar = st.progress(0, text="Processing items...")
+
+    for i, (itemid, row) in enumerate(below.iterrows(), 1):
+        item_progress.info(f"Processing: **{row.itemname}** ({i} of {n})")
+        try:
+            action = refill_item(
+                itemid=itemid,
+                current_qty=row.totalquantity,
+                meta=row,
+            )
+        except Exception as e:
+            action = f"Error: {e}"
+            if DEBUG:
+                st.error(f"Error processing {row.itemname}: {e}")
         log.append({"item": row.itemname, "action": action})
+        step_bar.progress(i / n, text=f"Processed {i}/{n}")
+        if DEBUG:
+            time.sleep(0.15)  # makes progress visible if items process instantly
+
+    item_progress.success("Cycle complete!")
+    step_bar.progress(1.0, text="Done.")
+
     return log
 
 # ─────────── main loop ───────────
@@ -132,7 +156,10 @@ if st.session_state.running:
     rem = SECONDS - (now - st.session_state.last_ts)
     if rem <= 0:
         try:
-            st.session_state.last_log = run_cycle()
+            log = run_cycle()
+            st.session_state.last_log = log
+            if log:
+                st.session_state.history_log.extend(log)
         except Exception as exc:
             st.error("⛔ " + "".join(traceback.format_exception_only(type(exc), exc)))
             st.session_state.running = False
@@ -159,6 +186,13 @@ if st.session_state.running:
                          use_container_width=True)
         else:
             st.write("— nothing this time —")
+
+    with st.expander("All actions this session (history)", expanded=False):
+        if st.session_state.history_log:
+            st.dataframe(pd.DataFrame(st.session_state.history_log),
+                         use_container_width=True)
+        else:
+            st.write("— no actions yet —")
 
     time.sleep(0.15)
     st.rerun()
