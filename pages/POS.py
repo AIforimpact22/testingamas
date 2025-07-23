@@ -140,7 +140,70 @@ def next_gap(sim_dt: datetime) -> float:
     return base_interval(sim_dt) / SPEED
 
 # ───────────── INVENTORY & SHELF CYCLES ─────────────
-# (unchanged – exactly the same as before)
+def inventory_cycle() -> int:
+    snap = INV.stock_levels()
+    below = snap[snap.totalqty < snap.threshold].copy()
+    if below.empty:
+        return 0
+    below["need"] = below["average"] - below["totalqty"]
+    logs = INV.restock_items_bulk(below[["itemid", "need", "sellingprice"]])["log"]
+    st.session_state.inv_all_logs.extend(logs)
+    return len(logs)
+
+def shelf_cycle() -> int:
+    meta = SHELF.get_all_items().set_index("itemid")
+    kpi  = SHELF.get_shelf_quantity_by_item().set_index("itemid")
+    df   = meta.join(kpi, how="left").fillna({"totalquantity": 0})
+    df["totalquantity"] = df.totalquantity.astype(int)
+    below = df[df.totalquantity < df.shelfthreshold]
+    moved = 0
+    sh_log = []
+    for itemid, row in below.iterrows():
+        thresh, avg, current = row.shelfthreshold, row.shelfaverage, row.totalquantity
+        need = max(avg - current, thresh - current)
+        need = SHELF.resolve_shortages(itemid=itemid, qty_need=need,
+                                       user="AUTO‑UNIFIED")
+        if need <= 0:
+            continue
+        layers = SHELF.fetch_data(
+            """
+            SELECT expirationdate, quantity, cost_per_unit
+              FROM inventory
+             WHERE itemid=%s AND quantity>0
+          ORDER BY expirationdate, cost_per_unit
+            """,
+            (itemid,),
+        )
+        for lyr in layers.itertuples():
+            take = min(need, int(lyr.quantity))
+            SHELF.transfer_from_inventory(
+                itemid=itemid,
+                expirationdate=lyr.expirationdate,
+                quantity=take,
+                cost_per_unit=float(lyr.cost_per_unit),
+                created_by="AUTO‑UNIFIED",
+            )
+            need  -= take
+            moved += take
+            sh_log.append({
+                "itemid": itemid,
+                "itemname": row.itemname,
+                "quantity": take,
+                "timestamp": datetime.now().strftime("%F %T"),
+            })
+            if need == 0:
+                break
+        if need > 0:
+            SHELF.execute_command(
+                """
+                INSERT INTO shelf_shortage
+                      (saleid, itemid, shortage_qty, logged_at)
+                VALUES (0,%s,%s,CURRENT_TIMESTAMP)
+                """,
+                (itemid, need),
+            )
+    st.session_state.sh_all_logs.extend(sh_log)
+    return moved
 # inventory_cycle() and shelf_cycle() remain intact
 # --------------------------------------------------------------------- #
 def inventory_cycle() -> int:
