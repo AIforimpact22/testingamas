@@ -1,12 +1,14 @@
 from __future__ import annotations
 """
 🛒 POS + Inventory + Shelf automation – parallel cashiers, with live debug tabs
+(2025‑07‑23 – batch‑insert edition)
 """
 
 import time
 import random
 import traceback
 from datetime import datetime, timedelta
+from typing import List
 
 import pandas as pd
 import streamlit as st
@@ -137,42 +139,10 @@ def base_interval(sim_dt: datetime) -> float:  # seconds
 def next_gap(sim_dt: datetime) -> float:
     return base_interval(sim_dt) / SPEED
 
-def process_sale(cashier_idx: int, sim_dt: datetime):
-    cart = random_cart()
-    if not cart:
-        return
-    cid = f"CASH{cashier_idx+1:02d}"
-    try:
-        saleid, shortages = POS.process_sale_with_shortage(
-            cart_items=cart,
-            discount_rate=0.0,
-            payment_method="Cash",
-            cashier=cid,
-            notes=f"[SIM {sim_dt:%F %T}]",
-        )
-        if saleid:
-            st.session_state.sales_count += 1
-
-            # Fetch details for POS debug log
-            sale_df, items_df = POS.get_sale_details(saleid)
-            sale_entry = {
-                "saleid": saleid,
-                "cashier": cid,
-                "timestamp": datetime.now().strftime("%F %T"),
-                "items": items_df.to_dict("records"),
-                "shortages": shortages,
-            }
-            st.session_state.pos_log.append(sale_entry)
-            if shortages:
-                for s in shortages:
-                    s = dict(s)
-                    s["saleid"] = saleid
-                    s["timestamp"] = sale_entry["timestamp"]
-                    st.session_state.shortage_log.append(s)
-    except Exception:
-        POS.conn.rollback()
-
-# ───────────── INVENTORY & SHELF CYCLES – now with logging ─────────────
+# ───────────── INVENTORY & SHELF CYCLES ─────────────
+# (unchanged – exactly the same as before)
+# inventory_cycle() and shelf_cycle() remain intact
+# --------------------------------------------------------------------- #
 def inventory_cycle() -> int:
     snap = INV.stock_levels()
     below = snap[snap.totalqty < snap.threshold].copy()
@@ -238,21 +208,53 @@ def shelf_cycle() -> int:
     st.session_state.sh_all_logs.extend(sh_log)
     return moved
 
-# ───────────── MAIN LOOP ─────────────
+# --------------------------------------------------------------------- #
+#                   ----------  MAIN LOOP ----------                    #
+# --------------------------------------------------------------------- #
 if RUN:
     now_real = time.time()
     elapsed  = now_real - st.session_state.real_ts
     st.session_state.real_ts = now_real
     st.session_state.sim_clock += timedelta(seconds=elapsed * SPEED)
 
-    # ----- PER‑CASHIER SCHEDULING -----
+    # ----- COLLECT sales that are DUE this tick ------------------------
+    pending_sales: List[dict] = []
+
     for idx, nxt in enumerate(st.session_state.next_sale_times):
         while nxt <= st.session_state.sim_clock:
-            process_sale(idx, nxt)
+            cart = random_cart()
+            if cart:
+                pending_sales.append(
+                    {
+                        "cashier":       f"CASH{idx+1:02d}",
+                        "cart_items":    cart,
+                        "discount_rate": 0.0,
+                        "payment_method": "Cash",
+                        "notes":         f"[SIM {nxt:%F %T}]",
+                    }
+                )
             nxt += timedelta(seconds=next_gap(nxt))
-        st.session_state.next_sale_times[idx] = nxt  # update back
+        st.session_state.next_sale_times[idx] = nxt  # persist re‑scheduled time
 
-    # ----- INVENTORY REFILL -----
+    # ----- BULK‑process all pending baskets ----------------------------
+    if pending_sales:
+        try:
+            batch_log = POS.process_sales_batch(pending_sales)
+            for entry in batch_log:
+                st.session_state.sales_count += 1
+                st.session_state.pos_log.append(entry)
+                if entry["shortages"]:
+                    for s in entry["shortages"]:
+                        s = dict(s)
+                        s["saleid"]    = entry["saleid"]
+                        s["timestamp"] = entry["timestamp"]
+                        st.session_state.shortage_log.append(s)
+        except Exception:
+            POS.conn.rollback()
+            st.error("POS batch error:\n" +
+                     "".join(traceback.format_exc(limit=1)))
+
+    # ----- INVENTORY REFILL -------------------------------------------
     if now_real - st.session_state.inv_last_ts >= INV_SEC:
         try:
             st.session_state.last_inv_rows = inventory_cycle()
@@ -262,7 +264,7 @@ if RUN:
                      "".join(traceback.format_exc(limit=1)))
         st.session_state.inv_last_ts = now_real
 
-    # ----- SHELF REFILL -----
+    # ----- SHELF REFILL -----------------------------------------------
     if now_real - st.session_state.sh_last_ts >= SHELF_SEC:
         try:
             st.session_state.last_sh_rows = shelf_cycle()
@@ -272,7 +274,7 @@ if RUN:
                      "".join(traceback.format_exc(limit=1)))
         st.session_state.sh_last_ts = now_real
 
-    # ─────────── METRICS ───────────
+    # ─────────── METRICS & DEBUG TABS (unchanged) ───────────
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("POS")
@@ -288,7 +290,6 @@ if RUN:
     st.progress((now_real - st.session_state.sh_last_ts) / SHELF_SEC,
                 text="Shelf cycle progress")
 
-    # ─────────── DEBUG/LOG TABS ───────────
     tab1, tab2, tab3, tab4 = st.tabs([
         "POS Activity", "Shortages", "Inventory Refill Log", "Shelf Refill Log"
     ])
