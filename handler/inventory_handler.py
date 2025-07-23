@@ -1,110 +1,169 @@
+"""
+InventoryHandler – bulk‑refills warehouse stock.
+
+new param: debug → if True, returns (log, debug_info)
+"""
+
 from __future__ import annotations
-"""
-🏬 Inventory Bulk Restock – Live Progress & Logs
-"""
+from datetime import date
+from typing import List, Tuple, Dict, Any
 
-import time
 import pandas as pd
-import streamlit as st
-from datetime import datetime
+from psycopg2.extras import execute_values
 
-from handler.inventory_handler import InventoryHandler  # update import as needed
+from db_handler import DatabaseManager
 
-st.set_page_config(page_title="Inventory Bulk Restock", page_icon="🏬")
-st.title("🏬 Inventory Bulk Restock")
+# ───────── constants ─────────
+DEFAULT_THRESHOLD   = 50
+DEFAULT_AVERAGE     = 100
+GENERIC_SUPPLIER_ID = 510
+FIX_EXPIRY          = date(2027, 7, 21)
+FIX_WH_LOC          = "A2"
 
-# --- Session log for all runs ---
-st.session_state.setdefault("bulk_history", [])
 
-handler = InventoryHandler()
+class InventoryHandler(DatabaseManager):
 
-# --- Demo/Upload: How will you get df_need? ---
-st.subheader("Preview: Items Needing Restock")
-df_need = None
-# Option 1: Upload CSV (columns: itemid, need, sellingprice)
-up = st.file_uploader("Upload .csv with 'itemid','need','sellingprice'", type="csv")
-if up is not None:
-    df_need = pd.read_csv(up)
-elif "df_need_demo" not in st.session_state:
-    # Option 2: Generate Demo (for testing)
-    demo_data = [
-        dict(itemid=1001, need=120, sellingprice=25.5),
-        dict(itemid=1002, need=80, sellingprice=13.8),
-        dict(itemid=1003, need=70, sellingprice=11.0),
-    ]
-    df_need = pd.DataFrame(demo_data)
-    st.session_state["df_need_demo"] = df_need
-else:
-    df_need = st.session_state["df_need_demo"]
+    # ───────── snapshot ─────────
+    def stock_levels(self) -> pd.DataFrame:
+        inv = self.fetch_data(
+            "SELECT itemid, SUM(quantity)::int AS totalqty "
+            "FROM   inventory GROUP BY itemid"
+        )
+        if inv.empty:
+            inv = pd.DataFrame(columns=["itemid", "totalqty"])
 
-if df_need is not None:
-    st.dataframe(df_need, use_container_width=True)
-else:
-    st.info("Please upload or generate a list of items to restock.")
+        meta = self.fetch_data(
+            f"""
+            SELECT itemid,
+                   itemnameenglish,
+                   COALESCE(threshold,       {DEFAULT_THRESHOLD}) AS threshold,
+                   COALESCE(averagerequired, {DEFAULT_AVERAGE})   AS average,
+                   COALESCE(sellingprice,0)                     AS sellingprice
+            FROM   item
+            """
+        )
+        df = meta.merge(inv, on="itemid", how="left")
+        df["totalqty"] = df["totalqty"].fillna(0).astype(int)
+        return df
 
-# --- Bulk Restock Button ---
-if df_need is not None:
-    run_bulk = st.button("Bulk Restock Now")
+    # ───────── helpers ─────────
+    def supplier_for(self, itemid: int) -> int:
+        res = self.fetch_data(
+            "SELECT supplierid FROM itemsupplier WHERE itemid=%s LIMIT 1",
+            (itemid,),
+        )
+        return GENERIC_SUPPLIER_ID if res.empty else int(res.iloc[0, 0])
 
-    if run_bulk:
-        st.session_state["run_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log = []
-        debug_per_supplier = {}
-        supplier_ids = df_need["itemid"].apply(handler.supplier_for)
-        suppliers = sorted(set(supplier_ids))
-        supplier_map = dict(zip(df_need["itemid"], supplier_ids))
-        df_need = df_need.copy()
-        df_need["supplier"] = df_need["itemid"].map(supplier_map)
-        total_sup = len(df_need["supplier"].unique())
-
-        pbar = st.progress(0, text="Preparing...")
-        status = st.empty()
-
-        for j, (sup_id, grp) in enumerate(df_need.groupby("supplier"), 1):
-            status.info(f"Restocking for supplier {sup_id} ({j} of {total_sup}) ...")
-            # Run a single-supplier restock by slicing df_need for just this supplier
-            result = handler.restock_items_bulk(grp, debug=True)
-            for entry in result["log"]:
-                entry["supplier"] = sup_id
-                entry["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            log.extend(result["log"])
-            debug_per_supplier[sup_id] = grp
-            pbar.progress(j / total_sup, text=f"Completed {j}/{total_sup} suppliers")
-            time.sleep(0.2)
-        pbar.progress(1.0, text="Done.")
-
-        st.session_state["bulk_history"].append(
-            dict(
-                timestamp=st.session_state["run_ts"],
-                log=log,
-                debug=debug_per_supplier
-            )
+    def _create_po(self, supplier_id: int) -> int:
+        return int(
+            self.execute_command_returning(
+                """
+                INSERT INTO purchaseorders
+                      (supplierid,status,orderdate,expecteddelivery,
+                       actualdelivery,createdby,suppliernote,totalcost)
+                VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,
+                        CURRENT_DATE,'AutoInventory','AUTO BULK',0)
+                RETURNING poid
+                """,
+                (supplier_id,),
+            )[0]
         )
 
-        st.success(f"Bulk restock complete: {len(log)} items processed for {total_sup} suppliers.")
+    def _add_lines_and_costs(
+        self, poid: int, items: List[Tuple[int, int, float]]
+    ) -> List[int]:
+        po_rows   = [(poid, it, q, q, cpu) for it, q, cpu in items]
+        cost_rows = [(poid, it, cpu, q, "Auto Refill") for it, q, cpu in items]
 
-        # Show results in tabs
-        tab1, tab2, tab3 = st.tabs(["Action Log", "By Supplier", "Bulk Run History"])
-        with tab1:
-            st.subheader("Action Log (this run)")
-            st.dataframe(pd.DataFrame(log), use_container_width=True)
+        with self.conn:
+            with self.conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO purchaseorderitems
+                          (poid,itemid,orderedquantity,receivedquantity,estimatedprice)
+                    VALUES %s
+                    """,
+                    po_rows,
+                )
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO poitemcost
+                          (poid,itemid,cost_per_unit,quantity,note,cost_date)
+                    SELECT x.poid,x.itemid,x.cpu,x.qty,x.note,CURRENT_TIMESTAMP
+                    FROM (VALUES %s) x(poid,itemid,cpu,qty,note)
+                    RETURNING costid
+                    """,
+                    cost_rows,
+                )
+                cost_ids = [row[0] for row in cur.fetchall()]
+        return cost_ids
 
-        with tab2:
-            st.subheader("Supplier-wise breakdown (this run)")
-            for sup_id, df_s in debug_per_supplier.items():
-                st.markdown(f"**Supplier {sup_id}**")
-                st.dataframe(df_s, use_container_width=True)
+    def _insert_inventory(
+        self,
+        rows: List[Tuple[int, int, float, int, int]],
+    ) -> None:
+        inv_rows = [
+            (it, qty, FIX_EXPIRY, FIX_WH_LOC, cpu, poid, cid)
+            for it, qty, cpu, poid, cid in rows
+        ]
+        with self.conn:
+            with self.conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO inventory
+                          (itemid,quantity,expirationdate,storagelocation,
+                           cost_per_unit,poid,costid)
+                    VALUES %s
+                    """,
+                    inv_rows,
+                )
 
-        with tab3:
-            st.subheader("Bulk Run History (all in this session)")
-            for i, entry in enumerate(reversed(st.session_state["bulk_history"]), 1):
-                with st.expander(f"Run at {entry['timestamp']}", expanded=(i == 1)):
-                    st.write("Log:")
-                    st.dataframe(pd.DataFrame(entry["log"]), use_container_width=True)
-                    st.write("Supplier debug breakdown:")
-                    for sup_id, df_s in entry["debug"].items():
-                        st.markdown(f"**Supplier {sup_id}**")
-                        st.dataframe(df_s, use_container_width=True)
+    # ───────── public API ─────────
+    def restock_items_bulk(
+        self,
+        df_need: pd.DataFrame,
+        *,
+        debug: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        If *debug* → returns dict with keys:
+          log         – normal action log
+          by_supplier – {supplier_id: DataFrame_of_items}
+        Else returns {'log': …}
+        """
+        df_need = df_need.copy()
+        df_need["supplier"] = df_need["itemid"].apply(self.supplier_for)
 
-    else:
-        st.info("Press **Bulk Restock Now** to process all items in the list.")
+        log: List[dict] = []
+        dbg: Dict[int, pd.DataFrame] = {}
+
+        for sup_id, grp in df_need.groupby("supplier"):
+            poid  = self._create_po(int(sup_id))
+            items = [
+                (
+                    int(r.itemid),
+                    int(r.need),
+                    round(float(r.sellingprice) * 0.75, 2) if r.sellingprice else 0.0,
+                )
+                for _, r in grp.iterrows()
+            ]
+
+            cost_ids = self._add_lines_and_costs(poid, items)
+            inv_rows = [
+                (it, qty, cpu, poid, cid)
+                for (it, qty, cpu), cid in zip(items, cost_ids)
+            ]
+            self._insert_inventory(inv_rows)
+
+            for (it, qty, cpu), cid in zip(items, cost_ids):
+                log.append(
+                    dict(itemid=it, added=qty, cpu=cpu, poid=poid, costid=cid)
+                )
+
+            if debug:
+                dbg[int(sup_id)] = grp.copy()
+
+        return {"log": log, "by_supplier": dbg} if debug else {"log": log}
