@@ -1,15 +1,20 @@
 """
-InventoryHandler – bulk‑refills warehouse stock.
+InventoryHandler – bulk‑refills warehouse stock
+(batch‑safe edition, 2025‑07‑24)
 
-new param: debug → if True, returns (log, debug_info)
+• Guarantees the purchase‑orders sequence is ahead of MAX(poid)
+  so inserts never collide with existing keys.
+• Public API and data‑shape unchanged.
 """
 
 from __future__ import annotations
+
 from datetime import date
-from typing import List, Tuple, Dict, Any
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 from psycopg2.extras import execute_values
+from psycopg2 import errors as pgerr
 
 from db_handler import DatabaseManager
 
@@ -22,8 +27,7 @@ FIX_WH_LOC          = "A2"
 
 
 class InventoryHandler(DatabaseManager):
-
-    # ───────── snapshot ─────────
+    # ───────────────────────── snapshot helpers ──────────────────────
     def stock_levels(self) -> pd.DataFrame:
         inv = self.fetch_data(
             "SELECT itemid, SUM(quantity)::int AS totalqty "
@@ -46,7 +50,7 @@ class InventoryHandler(DatabaseManager):
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ───────── helpers ─────────
+    # ───────────────────────── misc helpers ──────────────────────────
     def supplier_for(self, itemid: int) -> int:
         res = self.fetch_data(
             "SELECT supplierid FROM itemsupplier WHERE itemid=%s LIMIT 1",
@@ -54,21 +58,61 @@ class InventoryHandler(DatabaseManager):
         )
         return GENERIC_SUPPLIER_ID if res.empty else int(res.iloc[0, 0])
 
-    def _create_po(self, supplier_id: int) -> int:
-        return int(
-            self.execute_command_returning(
-                """
-                INSERT INTO purchaseorders
-                      (supplierid,status,orderdate,expecteddelivery,
-                       actualdelivery,createdby,suppliernote,totalcost)
-                VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,
-                        CURRENT_DATE,'AutoInventory','AUTO BULK',0)
-                RETURNING poid
-                """,
-                (supplier_id,),
-            )[0]
+    # ---- NEW: keep sequence ahead of existing POIDs -----------------
+    def _sync_po_sequence(self, cur) -> None:
+        cur.execute("SELECT MAX(poid) FROM purchaseorders")
+        max_poid = cur.fetchone()[0] or 0
+        # Set sequence *to* max (nextval will return max+1)
+        cur.execute(
+            "SELECT setval('purchaseorders_poid_seq', %s, true)",
+            (max_poid,),
         )
 
+    # -----------------------------------------------------------------
+    def _create_po(self, supplier_id: int) -> int:
+        """
+        Inserts a Completed purchase‑order and returns its poid.
+        Guarantees sequence sync even if someone inserted manual IDs.
+        """
+        self._ensure_live_conn()
+        with self.conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO purchaseorders
+                          (supplierid,status,orderdate,expecteddelivery,
+                           actualdelivery,createdby,suppliernote,totalcost)
+                    VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,
+                            CURRENT_DATE,'AutoInventory','AUTO BULK',0)
+                    RETURNING poid
+                    """,
+                    (supplier_id,),
+                )
+                poid = cur.fetchone()[0]
+                self.conn.commit()
+                return int(poid)
+            except pgerr.UniqueViolation:
+                # Sequence lagged behind – fix and retry once
+                self.conn.rollback()
+                self._sync_po_sequence(cur)
+                self.conn.commit()           # commit the setval
+                with self.conn.cursor() as cur2:
+                    cur2.execute(
+                        """
+                        INSERT INTO purchaseorders
+                              (supplierid,status,orderdate,expecteddelivery,
+                               actualdelivery,createdby,suppliernote,totalcost)
+                        VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,
+                                CURRENT_DATE,'AutoInventory','AUTO BULK',0)
+                        RETURNING poid
+                        """,
+                        (supplier_id,),
+                    )
+                    poid = cur2.fetchone()[0]
+                    self.conn.commit()
+                    return int(poid)
+
+    # -----------------------------------------------------------------
     def _add_lines_and_costs(
         self, poid: int, items: List[Tuple[int, int, float]]
     ) -> List[int]:
@@ -121,7 +165,7 @@ class InventoryHandler(DatabaseManager):
                     inv_rows,
                 )
 
-    # ───────── public API ─────────
+    # ───────────────────────── public API ────────────────────────────
     def restock_items_bulk(
         self,
         df_need: pd.DataFrame,
