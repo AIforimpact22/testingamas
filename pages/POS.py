@@ -21,6 +21,11 @@ from handler.selling_area_handler import SellingAreaHandler
 st.set_page_config(page_title="Unified POS / Refill", page_icon="🛒")
 st.title("🛒 POS + Inventory + Shelf automation")
 
+# ───────────── PERSISTENT PLACEHOLDERS (stop duplicate widgets) ─────────────
+inv_progress_ph   = st.empty()
+shelf_progress_ph = st.empty()
+tabs_ph           = st.empty()
+
 # ───────────── SIDEBAR – POS PARAMS ─────────────
 st.sidebar.header("POS parameters")
 SPEED   = st.sidebar.number_input("Speed multiplier (×)", 1, 200, 1, 1)
@@ -301,57 +306,60 @@ if RUN:
         st.metric("Inv rows last",   st.session_state.last_inv_rows)
         st.metric("Shelf qty moved", st.session_state.last_sh_rows)
 
-    st.progress(
+    # stable progress bars
+    inv_progress_ph.progress(
         (now_real - st.session_state.inv_last_ts) / INV_SEC,
         text="Inventory cycle progress",
     )
-    st.progress(
+    shelf_progress_ph.progress(
         (now_real - st.session_state.sh_last_ts) / SHELF_SEC,
         text="Shelf cycle progress",
     )
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["POS Activity", "Shortages", "Inventory Refill Log", "Shelf Refill Log"]
-    )
+    # stable tab container
+    with tabs_ph.container():
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["POS Activity", "Shortages", "Inventory Refill Log", "Shelf Refill Log"]
+        )
 
-    with tab1:
-        st.subheader("Recent Sales (last 10)")
-        if st.session_state.pos_log:
-            for entry in reversed(st.session_state.pos_log[-10:]):
-                with st.expander(
-                    f"Sale {entry['saleid']} at {entry['timestamp']} "
-                    f"(Cashier: {entry['cashier']})"
-                ):
-                    st.write("Items:")
-                    st.dataframe(pd.DataFrame(entry["items"]))
-                    if entry["shortages"]:
-                        st.write("Shortages in this sale:")
-                        st.dataframe(pd.DataFrame(entry["shortages"]))
-                    else:
-                        st.write("No shortages for this sale.")
-        else:
-            st.write("No sales yet.")
+        with tab1:
+            st.subheader("Recent Sales (last 10)")
+            if st.session_state.pos_log:
+                for entry in reversed(st.session_state.pos_log[-10:]):
+                    with st.expander(
+                        f"Sale {entry['saleid']} at {entry['timestamp']} "
+                        f"(Cashier: {entry['cashier']})"
+                    ):
+                        st.write("Items:")
+                        st.dataframe(pd.DataFrame(entry["items"]))
+                        if entry["shortages"]:
+                            st.write("Shortages in this sale:")
+                            st.dataframe(pd.DataFrame(entry["shortages"]))
+                        else:
+                            st.write("No shortages for this sale.")
+            else:
+                st.write("No sales yet.")
 
-    with tab2:
-        st.subheader("All Shortages this session")
-        if st.session_state.shortage_log:
-            st.dataframe(pd.DataFrame(st.session_state.shortage_log))
-        else:
-            st.write("No shortages so far.")
+        with tab2:
+            st.subheader("All Shortages this session")
+            if st.session_state.shortage_log:
+                st.dataframe(pd.DataFrame(st.session_state.shortage_log))
+            else:
+                st.write("No shortages so far.")
 
-    with tab3:
-        st.subheader("Inventory Auto‑Refill (all cycles)")
-        if st.session_state.inv_all_logs:
-            st.dataframe(pd.DataFrame(st.session_state.inv_all_logs))
-        else:
-            st.write("No inventory auto‑refills yet.")
+        with tab3:
+            st.subheader("Inventory Auto‑Refill (all cycles)")
+            if st.session_state.inv_all_logs:
+                st.dataframe(pd.DataFrame(st.session_state.inv_all_logs))
+            else:
+                st.write("No inventory auto‑refills yet.")
 
-    with tab4:
-        st.subheader("Shelf Auto‑Refill (all cycles)")
-        if st.session_state.sh_all_logs:
-            st.dataframe(pd.DataFrame(st.session_state.sh_all_logs))
-        else:
-            st.write("No shelf auto‑refills yet.")
+        with tab4:
+            st.subheader("Shelf Auto‑Refill (all cycles)")
+            if st.session_state.sh_all_logs:
+                st.dataframe(pd.DataFrame(st.session_state.sh_all_logs))
+            else:
+                st.write("No shelf auto‑refills yet.")
 
     # ---- Refresh loop ------------------------------------------------------
     time.sleep(0.2)
