@@ -2,8 +2,8 @@
 InventoryHandler – bulk‑refills warehouse stock
 (batch‑safe edition, 2025‑07‑24)
 
-• Guarantees the purchase‑orders sequence is always ahead of MAX(poid)
-  so inserts never collide with existing keys.
+• Keeps purchase‑order *and* PO‑item sequences ahead of existing keys,
+  preventing duplicate‑key violations.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ FIX_WH_LOC          = "A2"
 
 
 class InventoryHandler(DatabaseManager):
-    # ───────────── snapshot ─────────────
+    # ───────────────────── snapshot helpers ──────────────────────
     def stock_levels(self) -> pd.DataFrame:
         inv = self.fetch_data(
             "SELECT itemid, SUM(quantity)::int AS totalqty "
@@ -49,7 +49,7 @@ class InventoryHandler(DatabaseManager):
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ───────────── helpers ─────────────
+    # ───────────────────── misc helpers ──────────────────────────
     def supplier_for(self, itemid: int) -> int:
         res = self.fetch_data(
             "SELECT supplierid FROM itemsupplier WHERE itemid=%s LIMIT 1",
@@ -57,39 +57,19 @@ class InventoryHandler(DatabaseManager):
         )
         return GENERIC_SUPPLIER_ID if res.empty else int(res.iloc[0, 0])
 
-    # -- keep purchaseorders_poid_seq ahead of MAX(poid) ----------------
-    def _sync_po_sequence(self, cur) -> None:
-        cur.execute("SELECT MAX(poid) FROM purchaseorders")
-        max_poid = cur.fetchone()[0] or 0
-        cur.execute(
-            "SELECT setval('purchaseorders_poid_seq', %s, true)", (max_poid,)
-        )
+    # ---------- sequence sync helpers ---------------------------------
+    def _sync_sequence(self, cur, seq: str, table: str, pk: str) -> None:
+        cur.execute(f"SELECT MAX({pk}) FROM {table}")
+        max_val = cur.fetchone()[0] or 0
+        cur.execute("SELECT setval(%s, %s, true)", (seq, max_val))
 
+    # ---------- purchase‑order header ---------------------------------
     def _create_po(self, supplier_id: int) -> int:
-        """Insert a Completed PO; sync sequence on the fly if needed."""
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO purchaseorders
-                          (supplierid,status,orderdate,expecteddelivery,
-                           actualdelivery,createdby,suppliernote,totalcost)
-                    VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,
-                            CURRENT_DATE,'AutoInventory','AUTO BULK',0)
-                    RETURNING poid
-                    """,
-                    (supplier_id,),
-                )
-                poid = cur.fetchone()[0]
-                self.conn.commit()
-                return int(poid)
-            except pgerr.UniqueViolation:
-                self.conn.rollback()
-                self._sync_po_sequence(cur)
-                self.conn.commit()
-                with self.conn.cursor() as cur2:
-                    cur2.execute(
+            for attempt in (1, 2):  # try once, sync seq, retry
+                try:
+                    cur.execute(
                         """
                         INSERT INTO purchaseorders
                               (supplierid,status,orderdate,expecteddelivery,
@@ -100,41 +80,71 @@ class InventoryHandler(DatabaseManager):
                         """,
                         (supplier_id,),
                     )
-                    poid = cur2.fetchone()[0]
+                    poid = cur.fetchone()[0]
                     self.conn.commit()
                     return int(poid)
+                except pgerr.UniqueViolation:
+                    self.conn.rollback()
+                    self._sync_sequence(
+                        cur,
+                        "purchaseorders_poid_seq",
+                        "purchaseorders",
+                        "poid",
+                    )
+                    self.conn.commit()
 
+    # ---------- PO lines & cost rows ---------------------------------
     def _add_lines_and_costs(
         self, poid: int, items: List[Tuple[int, int, float]]
     ) -> List[int]:
+        """
+        Returns list of costid for the rows just inserted.
+        Handles sequence sync for purchaseorderitems_poitemid_seq.
+        """
         po_rows   = [(poid, it, q, q, cpu) for it, q, cpu in items]
         cost_rows = [(poid, it, cpu, q, "Auto Refill") for it, q, cpu in items]
 
-        with self.conn:
-            with self.conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO purchaseorderitems
-                          (poid,itemid,orderedquantity,receivedquantity,estimatedprice)
-                    VALUES %s
-                    """,
-                    po_rows,
-                )
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO poitemcost
-                          (poid,itemid,cost_per_unit,quantity,note,cost_date)
-                    SELECT x.poid,x.itemid,x.cpu,x.qty,x.note,CURRENT_TIMESTAMP
-                    FROM (VALUES %s) x(poid,itemid,cpu,qty,note)
-                    RETURNING costid
-                    """,
-                    cost_rows,
-                )
-                cost_ids = [row[0] for row in cur.fetchall()]
-        return cost_ids
+        for attempt in (1, 2):
+            try:
+                with self.conn:
+                    with self.conn.cursor() as cur:
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO purchaseorderitems
+                                  (poid,itemid,orderedquantity,receivedquantity,
+                                   estimatedprice)
+                            VALUES %s
+                            """,
+                            po_rows,
+                        )
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO poitemcost
+                                  (poid,itemid,cost_per_unit,quantity,note,cost_date)
+                            SELECT x.poid,x.itemid,x.cpu,x.qty,x.note,
+                                   CURRENT_TIMESTAMP
+                              FROM (VALUES %s) x(poid,itemid,cpu,qty,note)
+                            RETURNING costid
+                            """,
+                            cost_rows,
+                        )
+                        return [row[0] for row in cur.fetchall()]
+            except pgerr.UniqueViolation:
+                if attempt == 1:
+                    with self.conn.cursor() as cur2:
+                        self._sync_sequence(
+                            cur2,
+                            "purchaseorderitems_poitemid_seq",
+                            "purchaseorderitems",
+                            "poitemid",
+                        )
+                        self.conn.commit()
+                else:
+                    raise  # second failure -> bubble up
 
+    # ---------- insert inventory layers ------------------------------
     def _insert_inventory(
         self,
         rows: List[Tuple[int, int, float, int, int]],
@@ -156,7 +166,7 @@ class InventoryHandler(DatabaseManager):
                     inv_rows,
                 )
 
-    # ───────────── public API ─────────────
+    # ───────────────────── public API ────────────────────────────────
     def restock_items_bulk(
         self,
         df_need: pd.DataFrame,
