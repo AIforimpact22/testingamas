@@ -4,8 +4,9 @@ POS_handler
 ───────────
 Database helpers for the live POS simulator.
 
-• `process_sales_batch()` bulk‑inserts N baskets in ONE transaction,
-  writing fully‑populated header rows first (no follow‑up UPDATE).
+• process_sales_batch() bulk‑inserts N baskets in ONE transaction,
+  subtracts shelf quantities, stamps `lastupdate`,
+  and records shortages.
 """
 
 from __future__ import annotations
@@ -34,17 +35,16 @@ class POSHandler(DatabaseManager):
         notes: str = "",
         original_saleid: int | None = None,
     ) -> int | None:
-        """Classic one‑sale insert (still available for ad‑hoc use)."""
-        sql = """
-        INSERT INTO sales (
-            totalamount, discountrate, totaldiscount, finalamount,
-            paymentmethod, cashier, notes, original_saleid
-        )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-        RETURNING saleid
-        """
+        """One‑off insert (still available elsewhere)."""
         res = self.execute_command_returning(
-            sql,
+            """
+            INSERT INTO sales (
+                totalamount, discountrate, totaldiscount, finalamount,
+                paymentmethod, cashier, notes, original_saleid
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING saleid
+            """,
             (
                 total_amount,
                 discount_rate,
@@ -58,52 +58,49 @@ class POSHandler(DatabaseManager):
         )
         return int(res[0]) if res else None
 
-    # ─────────────────────── Bulk sales commit ────────────────────────
+    # ─────────────────────── Bulk basket commit ────────────────────────
     def process_sales_batch(self, sales: List[Dict[str, Any]]) -> List[Dict]:
         """
-        Bulk‑process *multiple* baskets in ONE DB transaction.
+        Commit several baskets in ONE transaction.
 
-        Each element in `sales` must include:
+        Each sale dict must contain:
             cashier, cart_items, discount_rate, payment_method, notes
 
-        Returns
-        -------
-        list[dict] – entries for Streamlit debug log
+        Returns a list of log dicts for the Streamlit debug panel.
         """
         if not sales:
             return []
 
-        self._ensure_live_conn()
         ts_now = datetime.now().strftime("%F %T")
-        log_out: list[Dict] = []
+        self._ensure_live_conn()
+        debug_log: list[Dict] = []
 
-        # ---- 1) build header rows with FINAL totals ------------------------
-        header_rows: list[tuple] = []
+        # 1) build header rows with final totals
+        header_rows = []
         for s in sales:
             gross = sum(
                 int(it["quantity"]) * float(it["sellingprice"])
                 for it in s["cart_items"]
             )
             disc  = round(gross * s["discount_rate"] / 100, 2)
-            final = gross - disc
             header_rows.append(
                 (
-                    gross,
-                    s["discount_rate"],
-                    disc,
-                    final,
+                    gross,                      # totalamount
+                    s["discount_rate"],         # discountrate
+                    disc,                       # totaldiscount
+                    gross - disc,               # finalamount
                     s["payment_method"],
                     s["cashier"],
                     s.get("notes", ""),
-                    None,  # original_saleid
+                    None,                       # original_saleid
                 )
             )
 
         with self.conn.cursor() as cur:
-            # ---- 2) insert headers, capture IDs ---------------------------
+            # 2) insert headers, capture IDs
             saleids = [
-                row[0]
-                for row in execute_values(
+                r[0]
+                for r in execute_values(
                     cur,
                     """
                     INSERT INTO sales (
@@ -118,75 +115,84 @@ class POSHandler(DatabaseManager):
                 )
             ]
 
-            items_rows:    list[tuple] = []
-            shortage_rows: list[tuple] = []
+            items_rows:    List[tuple] = []
+            shortage_rows: List[tuple] = []
 
-            # ---- 3) process each basket ----------------------------------
+            # 3) deplete shelf + collect detail rows
             for sid, sale in zip(saleids, sales):
-                local_items:     list[Dict] = []
-                local_shortages: list[Dict] = []
+                local_items, local_short = [], []
 
                 for it in sale["cart_items"]:
-                    iid  = int(it["itemid"])
-                    qty  = int(it["quantity"])
+                    iid   = int(it["itemid"])
+                    qty   = int(it["quantity"])
                     price = float(it["sellingprice"])
-                    remaining = qty
+                    remain = qty
 
-                    # FIFO depletion from shelf
+                    # FIFO layers for that item
                     cur.execute(
                         """
                         SELECT shelfid, quantity
                           FROM shelf
-                         WHERE itemid = %s AND quantity > 0
-                      ORDER BY expirationdate
+                         WHERE itemid=%s AND quantity>0
+                     ORDER BY expirationdate
                         """,
                         (iid,),
                     )
-                    for shelfid, q in cur.fetchall():
-                        if remaining == 0:
+                    for shelfid, layer_qty in cur.fetchall():
+                        if remain == 0:
                             break
-                        take = min(remaining, q)
-                        if take == q:
+                        take = min(remain, layer_qty)
+
+                        if take == layer_qty:  # consume entire layer
+                            # (optional) stamp before delete if auditing requires
+                            # cur.execute(
+                            #     "UPDATE shelf SET lastupdate=CURRENT_TIMESTAMP "
+                            #     "WHERE shelfid=%s", (shelfid,))
                             cur.execute("DELETE FROM shelf WHERE shelfid=%s",
                                         (shelfid,))
-                        else:
+                        else:                 # partial layer
                             cur.execute(
-                                "UPDATE shelf SET quantity = quantity - %s "
-                                "WHERE shelfid = %s",
+                                """
+                                UPDATE shelf
+                                   SET quantity   = quantity - %s,
+                                       lastupdate = CURRENT_TIMESTAMP
+                                 WHERE shelfid    = %s
+                                """,
                                 (take, shelfid),
                             )
-                        remaining -= take
+                        remain -= take
 
-                    tot_price = round(qty * price, 2)
-                    items_rows.append((sid, iid, qty, price, tot_price))
+                    total_price = round(qty * price, 2)
+                    items_rows.append((sid, iid, qty, price, total_price))
                     local_items.append(
-                        dict(itemid=iid,
-                             itemname=it.get("itemname"),
-                             quantity=qty,
-                             unitprice=price,
-                             totalprice=tot_price)
+                        dict(
+                            itemid=iid,
+                            itemname=it.get("itemname"),
+                            quantity=qty,
+                            unitprice=price,
+                            totalprice=total_price,
+                        )
                     )
 
-                    if remaining > 0:
-                        shortage_rows.append((sid, iid, remaining))
+                    if remain:  # shortage logged
+                        shortage_rows.append((sid, iid, remain))
                         name = self.fetch_data(
                             "SELECT itemnameenglish FROM item WHERE itemid=%s",
                             (iid,),
                         ).iat[0, 0]
-                        local_shortages.append({"itemname": name,
-                                                "qty": remaining})
+                        local_short.append({"itemname": name, "qty": remain})
 
-                log_out.append(
+                debug_log.append(
                     dict(
                         saleid=sid,
                         cashier=sale["cashier"],
                         timestamp=ts_now,
                         items=local_items,
-                        shortages=local_shortages,
+                        shortages=local_short,
                     )
                 )
 
-            # ---- 4) bulk‑insert items & shortages -------------------------
+            # 4) bulk‑insert items & shortages
             execute_values(
                 cur,
                 """
@@ -199,39 +205,34 @@ class POSHandler(DatabaseManager):
             if shortage_rows:
                 execute_values(
                     cur,
-                    """
-                    INSERT INTO shelf_shortage (saleid, itemid, shortage_qty)
-                    VALUES %s
-                    """,
+                    "INSERT INTO shelf_shortage (saleid,itemid,shortage_qty) VALUES %s",
                     shortage_rows,
                 )
 
             self.conn.commit()
 
-        return log_out
+        return debug_log
 
-    # ────────────────────────── Reporting ──────────────────────────────
+    # ────────────────────────── Reporting helpers ─────────────────────
     def get_sale_details(self, saleid: int):
-        sale_df = self.fetch_data(
-            "SELECT * FROM sales WHERE saleid=%s", (saleid,)
-        )
-        items_df = self.fetch_data(
+        hdr = self.fetch_data("SELECT * FROM sales WHERE saleid=%s", (saleid,))
+        det = self.fetch_data(
             """
             SELECT si.*, i.itemnameenglish AS itemname
               FROM salesitems si
-              JOIN item        i ON i.itemid = si.itemid
-             WHERE si.saleid = %s
+              JOIN item i ON i.itemid = si.itemid
+             WHERE si.saleid=%s
             """,
             (saleid,),
         )
-        return sale_df, items_df
+        return hdr, det
 
-    # ───────────────────── Held‑bill helpers ───────────────────────────
+    # ───────────────────────── Held‑bill helpers ──────────────────────
     def save_hold(self, *, cashier_id: str, label: str,
                   df_items: pd.DataFrame) -> int:
         payload = df_items[["itemid", "itemname",
                             "quantity", "price"]].to_dict("records")
-        hold_id = self.execute_command_returning(
+        hid = self.execute_command_returning(
             """
             INSERT INTO pos_holds (hold_label, cashier_id, items)
             VALUES (%s, %s, %s::jsonb)
@@ -239,30 +240,26 @@ class POSHandler(DatabaseManager):
             """,
             (label, cashier_id, json.dumps(payload)),
         )[0]
-        return int(hold_id)
+        return int(hid)
 
     def load_hold(self, hold_id: int) -> pd.DataFrame:
-        js = self.fetch_data(
-            "SELECT items FROM pos_holds WHERE holdid=%s", (hold_id,)
-        )
+        js = self.fetch_data("SELECT items FROM pos_holds WHERE holdid=%s",
+                             (hold_id,))
         if js.empty:
             raise ValueError("Hold not found")
-        data = js.iat[0, 0]
-        rows = json.loads(data) if isinstance(data, str) else data
+        rows = json.loads(js.iat[0, 0])
         df   = pd.DataFrame(rows)
 
         if "itemname" not in df.columns:
-            ids   = df["itemid"].tolist()
             names = self.fetch_data(
                 "SELECT itemid,itemnameenglish FROM item WHERE itemid IN %s",
-                (tuple(ids),)
+                (tuple(df.itemid),)
             ).set_index("itemid")["itemnameenglish"].to_dict()
-            df["itemname"] = df["itemid"].map(names).fillna("Unknown")
+            df["itemname"] = df.itemid.map(names).fillna("Unknown")
 
-        df["total"] = df["quantity"] * df["price"]
+        df["total"] = df.quantity * df.price
         return df[["itemid", "itemname", "quantity", "price", "total"]]
 
     def delete_hold(self, hold_id: int) -> None:
-        self.execute_command(
-            "DELETE FROM pos_holds WHERE holdid=%s", (hold_id,)
-        )
+        self.execute_command("DELETE FROM pos_holds WHERE holdid=%s",
+                             (hold_id,))
