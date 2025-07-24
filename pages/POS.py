@@ -1,7 +1,7 @@
 from __future__ import annotations
 """
-🛒 POS + Inventory + Shelf automation – parallel cashiers, with live debug tabs
-(2025‑07‑23 – batch‑insert edition, cleaned)
+🛒 POS + Inventory + Shelf automation – parallel cashiers with live debug tabs
+(batch‑insert edition, 2025‑07‑24)
 """
 
 import random
@@ -34,9 +34,6 @@ max_items = st.sidebar.number_input("Max items / sale", min_items, 30, 6)
 min_qty   = st.sidebar.number_input("Min qty / item", 1, 20, 1)
 max_qty   = st.sidebar.number_input("Max qty / item", min_qty, 50, 5)
 
-DEBUG_MODE = st.sidebar.checkbox("🔍 Debug mode")  # reserved for future use
-
-# ───────────── SIDEBAR – REFILL INTERVALS ─────────────
 st.sidebar.header("Automation intervals")
 
 
@@ -53,13 +50,13 @@ def _interval(label: str, default_val: int, default_unit="Minutes") -> int:
     return val * {"Seconds": 1, "Minutes": 60, "Hours": 3600, "Days": 86_400}[unit]
 
 
-INV_SEC = _interval("Inventory refill", 30)
+INV_SEC   = _interval("Inventory refill", 30)
 SHELF_SEC = _interval("Shelf refill", 10)
 
 # ───────────── SESSION STATE ─────────────
 defaults = dict(
     unified_run=False,
-    # POS
+    # POS timing
     real_ts=time.time(),
     sim_clock=datetime.now(),
     next_sale_times=[],
@@ -109,8 +106,8 @@ if b2.button("⏹ Stop", disabled=not RUN):
     RUN = False
 
 # ───────────── HANDLERS & CATALOG ─────────────
-POS = POSHandler()
-INV = InventoryHandler()
+POS   = POSHandler()
+INV   = InventoryHandler()
 SHELF = SellingAreaHandler()
 
 
@@ -145,7 +142,7 @@ def random_cart() -> list[dict]:
     ]
 
 
-def base_interval(sim_dt: datetime) -> float:  # seconds
+def base_interval(sim_dt: datetime) -> float:
     if PROFILE.startswith("Standard"):
         return 120.0
     h = sim_dt.hour
@@ -178,8 +175,8 @@ def inventory_cycle() -> int:
 
 def shelf_cycle() -> int:
     meta = SHELF.get_all_items().set_index("itemid")
-    kpi = SHELF.get_shelf_quantity_by_item().set_index("itemid")
-    df = meta.join(kpi, how="left").fillna({"totalquantity": 0})
+    kpi  = SHELF.get_shelf_quantity_by_item().set_index("itemid")
+    df   = meta.join(kpi, how="left").fillna({"totalquantity": 0})
     df["totalquantity"] = df.totalquantity.astype(int)
     below = df[df.totalquantity < df.shelfthreshold]
     moved, sh_log = 0, []
@@ -211,15 +208,15 @@ def shelf_cycle() -> int:
                 cost_per_unit=float(lyr.cost_per_unit),
                 created_by="AUTO‑UNIFIED",
             )
-            need -= take
+            need  -= take
             moved += take
             sh_log.append(
-                {
-                    "itemid": itemid,
-                    "itemname": row.itemname,
-                    "quantity": take,
-                    "timestamp": datetime.now().strftime("%F %T"),
-                }
+                dict(
+                    itemid=itemid,
+                    itemname=row.itemname,
+                    quantity=take,
+                    timestamp=datetime.now().strftime("%F %T"),
+                )
             )
             if need == 0:
                 break
@@ -239,7 +236,7 @@ def shelf_cycle() -> int:
 # ───────────── MAIN LOOP ─────────────
 if RUN:
     now_real = time.time()
-    elapsed = now_real - st.session_state.real_ts
+    elapsed  = now_real - st.session_state.real_ts
     st.session_state.real_ts = now_real
     st.session_state.sim_clock += timedelta(seconds=elapsed * SPEED)
 
@@ -250,13 +247,13 @@ if RUN:
             cart = random_cart()
             if cart:
                 pending_sales.append(
-                    {
-                        "cashier": f"CASH{idx+1:02d}",
-                        "cart_items": cart,
-                        "discount_rate": 0.0,
-                        "payment_method": "Cash",
-                        "notes": f"[SIM {nxt:%F %T}]",
-                    }
+                    dict(
+                        cashier=f"CASH{idx+1:02d}",
+                        cart_items=cart,
+                        discount_rate=0.0,
+                        payment_method="Cash",
+                        notes=f"[SIM {nxt:%F %T}]",
+                    )
                 )
             nxt += timedelta(seconds=next_gap(nxt))
         st.session_state.next_sale_times[idx] = nxt
@@ -269,10 +266,9 @@ if RUN:
                 st.session_state.sales_count += 1
                 st.session_state.pos_log.append(entry)
                 for s in entry["shortages"]:
-                    s = dict(s)
-                    s["saleid"] = entry["saleid"]
-                    s["timestamp"] = entry["timestamp"]
-                    st.session_state.shortage_log.append(s)
+                    st.session_state.shortage_log.append(
+                        {**s, "saleid": entry["saleid"], "timestamp": entry["timestamp"]}
+                    )
         except Exception:
             POS.conn.rollback()
             st.error("POS batch error:\n" + "".join(traceback.format_exc(limit=1)))
@@ -302,7 +298,7 @@ if RUN:
         st.metric("Sim time", f"{st.session_state.sim_clock:%F %T}")
     with col2:
         st.subheader("Automation")
-        st.metric("Inv rows last", st.session_state.last_inv_rows)
+        st.metric("Inv rows last",   st.session_state.last_inv_rows)
         st.metric("Shelf qty moved", st.session_state.last_sh_rows)
 
     st.progress(
