@@ -1,13 +1,14 @@
 """
 InventoryHandler – bulk‑refills warehouse stock
-(full seq‑sync edition, 2025‑07‑24)
+(recursion‑safe ∙ full‑seq‑sync · 2025‑07‑24)
 
-• Keeps every sequence in‑sync with its table’s MAX(primary_key):
+• Syncs every relevant sequence to MAX(pk) before inserts:
       purchaseorders_poid_seq
       purchaseorderitems_poitemid_seq
       poitemcost_costid_seq
       inventory_batchid_seq
-  preventing duplicate‑key violations under any restart/migration scenario.
+• Never nests a second connection context manager ⇒ no
+  "connection cannot be re‑entered recursively" errors.
 """
 
 from __future__ import annotations
@@ -30,10 +31,25 @@ FIX_WH_LOC          = "A2"
 
 
 class InventoryHandler(DatabaseManager):
+    # ---------- lightweight wrappers (NO with self.conn) -------------------
+    def execute_command(self, sql: str, params: tuple = ()) -> None:
+        self._ensure_live_conn()
+        cur = self.conn.cursor()
+        try:
+            cur.execute(sql, params)
+            self.conn.commit()
+        finally:
+            cur.close()
+
+    def fetch_data(self, sql: str, params: tuple = ()) -> pd.DataFrame:
+        self._ensure_live_conn()
+        return pd.read_sql_query(sql, self.conn, params=params)
+
     # ---------- generic seq‑sync helper ------------------------------------
     def _sync_sequence(self, cur, seq: str, table: str, pk: str) -> None:
         cur.execute(f"SELECT COALESCE(MAX({pk}),0) FROM {table}")
-        cur.execute("SELECT setval(%s, %s, true)", (seq, cur.fetchone()[0]))
+        max_val = cur.fetchone()[0]
+        cur.execute("SELECT setval(%s, %s, true)", (seq, max_val))
 
     # ---------- snapshot ---------------------------------------------------
     def stock_levels(self) -> pd.DataFrame:
@@ -58,7 +74,7 @@ class InventoryHandler(DatabaseManager):
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ---------- misc helpers ----------------------------------------------
+    # ---------- misc helper -------------------------------------------------
     def supplier_for(self, itemid: int) -> int:
         res = self.fetch_data(
             "SELECT supplierid FROM itemsupplier WHERE itemid=%s LIMIT 1",
@@ -69,35 +85,35 @@ class InventoryHandler(DatabaseManager):
     # ---------- purchase‑order header -------------------------------------
     def _create_po(self, supplier_id: int) -> int:
         self._ensure_live_conn()
-        with self.conn.cursor() as cur:
-            for attempt in (1, 2):
-                try:
-                    cur.execute(
-                        """
-                        INSERT INTO purchaseorders
-                              (supplierid,status,orderdate,expecteddelivery,
-                               actualdelivery,createdby,suppliernote,totalcost)
-                        VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,
-                                CURRENT_DATE,'AutoInventory','AUTO BULK',0)
-                        RETURNING poid
-                        """,
-                        (supplier_id,),
+        for attempt in (1, 2):
+            cur = self.conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO purchaseorders
+                          (supplierid,status,orderdate,expecteddelivery,
+                           actualdelivery,createdby,suppliernote,totalcost)
+                    VALUES (%s,'Completed',CURRENT_DATE,CURRENT_DATE,
+                            CURRENT_DATE,'AutoInventory','AUTO BULK',0)
+                    RETURNING poid
+                    """,
+                    (supplier_id,),
+                )
+                poid = cur.fetchone()[0]
+                self.conn.commit()
+                return int(poid)
+            except pgerr.UniqueViolation:
+                self.conn.rollback()
+                if attempt == 1:
+                    self._sync_sequence(
+                        cur, "purchaseorders_poid_seq",
+                        "purchaseorders", "poid"
                     )
-                    poid = cur.fetchone()[0]
                     self.conn.commit()
-                    return int(poid)
-                except pgerr.UniqueViolation:
-                    if attempt == 1:
-                        self.conn.rollback()
-                        self._sync_sequence(
-                            cur,
-                            "purchaseorders_poid_seq",
-                            "purchaseorders",
-                            "poid",
-                        )
-                        self.conn.commit()
-                    else:
-                        raise
+                else:
+                    raise
+            finally:
+                cur.close()
 
     # ---------- PO lines & cost rows --------------------------------------
     def _add_lines_and_costs(
@@ -107,51 +123,54 @@ class InventoryHandler(DatabaseManager):
         cost_rows = [(poid, it, cpu, q, "Auto Refill") for it, q, cpu in items]
 
         for attempt in (1, 2):
+            cur = self.conn.cursor()
             try:
-                with self.conn:
-                    with self.conn.cursor() as cur:
-                        # ensure sequences ahead **before** attempting inserts
-                        self._sync_sequence(
-                            cur, "purchaseorderitems_poitemid_seq",
-                            "purchaseorderitems", "poitemid"
-                        )
-                        self._sync_sequence(
-                            cur, "poitemcost_costid_seq",
-                            "poitemcost", "costid"
-                        )
-                        execute_values(
-                            cur,
-                            """
-                            INSERT INTO purchaseorderitems
-                                  (poid,itemid,orderedquantity,receivedquantity,
-                                   estimatedprice)
-                            VALUES %s
-                            """,
-                            po_rows,
-                        )
-                        execute_values(
-                            cur,
-                            """
-                            INSERT INTO poitemcost
-                                  (poid,itemid,cost_per_unit,quantity,note,cost_date)
-                            SELECT x.poid,x.itemid,x.cpu,x.qty,x.note,
-                                   CURRENT_TIMESTAMP
-                              FROM (VALUES %s) x(poid,itemid,cpu,qty,note)
-                            RETURNING costid
-                            """,
-                            cost_rows,
-                        )
-                        return [row[0] for row in cur.fetchall()]
+                # keep sequences ahead
+                self._sync_sequence(
+                    cur, "purchaseorderitems_poitemid_seq",
+                    "purchaseorderitems", "poitemid"
+                )
+                self._sync_sequence(
+                    cur, "poitemcost_costid_seq",
+                    "poitemcost", "costid"
+                )
+
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO purchaseorderitems
+                          (poid,itemid,orderedquantity,receivedquantity,
+                           estimatedprice)
+                    VALUES %s
+                    """,
+                    po_rows,
+                )
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO poitemcost
+                          (poid,itemid,cost_per_unit,quantity,note,cost_date)
+                    SELECT x.poid,x.itemid,x.cpu,x.qty,x.note,CURRENT_TIMESTAMP
+                    FROM (VALUES %s) x(poid,itemid,cpu,qty,note)
+                    RETURNING costid
+                    """,
+                    cost_rows,
+                )
+                cost_ids = [row[0] for row in cur.fetchall()]
+                self.conn.commit()
+                return cost_ids
             except pgerr.UniqueViolation:
+                self.conn.rollback()
                 if attempt == 1:
-                    with self.conn.cursor() as cur2:
-                        self._sync_sequence(
-                            cur2, "poitemcost_costid_seq",
-                            "poitemcost", "costid"
-                        )
-                        self.conn.commit()
+                    self._sync_sequence(
+                        cur, "poitemcost_costid_seq",
+                        "poitemcost", "costid"
+                    )
+                    self.conn.commit()
                 else:
                     raise
+            finally:
+                cur.close()
 
     # ---------- insert inventory layers -----------------------------------
     def _insert_inventory(
@@ -163,41 +182,38 @@ class InventoryHandler(DatabaseManager):
             for it, qty, cpu, poid, cid in rows
         ]
         for attempt in (1, 2):
+            cur = self.conn.cursor()
             try:
-                with self.conn:
-                    with self.conn.cursor() as cur:
-                        # sync batchid sequence once before first attempt
-                        if attempt == 1:
-                            self._sync_sequence(
-                                cur,
-                                "inventory_batchid_seq",
-                                "inventory",
-                                "batchid",
-                            )
-                        execute_values(
-                            cur,
-                            """
-                            INSERT INTO inventory
-                                  (itemid,quantity,expirationdate,storagelocation,
-                                   cost_per_unit,poid,costid)
-                            VALUES %s
-                            """,
-                            inv_rows,
-                        )
-                        return
-            except pgerr.UniqueViolation:
                 if attempt == 1:
-                    # another process inserted between sync and commit – resync
-                    with self.conn.cursor() as cur2:
-                        self._sync_sequence(
-                            cur2,
-                            "inventory_batchid_seq",
-                            "inventory",
-                            "batchid",
-                        )
-                        self.conn.commit()
+                    self._sync_sequence(
+                        cur, "inventory_batchid_seq",
+                        "inventory", "batchid"
+                    )
+
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO inventory
+                          (itemid,quantity,expirationdate,storagelocation,
+                           cost_per_unit,poid,costid)
+                    VALUES %s
+                    """,
+                    inv_rows,
+                )
+                self.conn.commit()
+                return
+            except pgerr.UniqueViolation:
+                self.conn.rollback()
+                if attempt == 1:
+                    self._sync_sequence(
+                        cur, "inventory_batchid_seq",
+                        "inventory", "batchid"
+                    )
+                    self.conn.commit()
                 else:
                     raise
+            finally:
+                cur.close()
 
     # ---------- public API -------------------------------------------------
     def restock_items_bulk(
@@ -213,7 +229,7 @@ class InventoryHandler(DatabaseManager):
         dbg: Dict[int, pd.DataFrame] = {}
 
         for sup_id, grp in df_need.groupby("supplier"):
-            poid  = self._create_po(int(sup_id))
+            poid = self._create_po(int(sup_id))
             items = [
                 (
                     int(r.itemid),
