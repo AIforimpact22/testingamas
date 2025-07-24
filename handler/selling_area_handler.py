@@ -2,22 +2,32 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any, Iterable, List, Tuple
+from typing import Any, List, Tuple
 from collections import defaultdict
+import os
+import json
+import logging
 
 import pandas as pd
 from psycopg2.extras import execute_values
 
 from db_handler import DatabaseManager
 
-# fallback location when an item is missing in item_slot
-DEFAULT_LOCID = "UNASSIGNED"
+# ─────────────────────────────  CONSTANTS  ──────────────────────────────
+DEFAULT_LOCID = "UNASSIGNED"          # fallback when no slot in item_slot
 
 
+# ════════════════════════════════════════════════════════════════════════
 class SellingAreaHandler(DatabaseManager):
-    # ─────────────────────────── SMALL HELPERS ────────────────────────────
-    @lru_cache(maxsize=10_000)  # slot mapping cache
+    """
+    High‑performance helper that can move every SKU that needs a top‑up
+    from *inventory* → *shelf* in **one transaction**.
+    """
+
+    # ───────────────────────── small helpers ──────────────────────────
+    @lru_cache(maxsize=10_000)
     def _lookup_locid(self, itemid: int) -> str | None:
+        """Return locid for item or None if not mapped."""
         df = self.fetch_data(
             "SELECT locid FROM item_slot WHERE itemid = %s LIMIT 1", (itemid,)
         )
@@ -34,15 +44,17 @@ class SellingAreaHandler(DatabaseManager):
         locid: str,
         created_by: str,
     ) -> None:
+        """
+        Single‑row upsert used by legacy per‑item code paths.
+        """
         cur.execute(
             """
             INSERT INTO shelf
                   (itemid, expirationdate, quantity, cost_per_unit, locid)
             VALUES (%s,%s,%s,%s,%s)
             ON CONFLICT (itemid, expirationdate, locid, cost_per_unit)
-            DO UPDATE
-               SET quantity    = shelf.quantity + EXCLUDED.quantity,
-                   lastupdated = CURRENT_TIMESTAMP
+            DO UPDATE SET quantity    = shelf.quantity + EXCLUDED.quantity,
+                          lastupdated = CURRENT_TIMESTAMP
             """,
             (itemid, expirationdate, quantity, cost_per_unit, locid),
         )
@@ -55,9 +67,7 @@ class SellingAreaHandler(DatabaseManager):
             (itemid, expirationdate, quantity, created_by, locid),
         )
 
-    # ────────────────────────── LEGACY METHODS ────────────────────────────
-    # (Kept so existing single‐item flows continue to work)
-
+    # ───────────────────── legacy single‑item API ──────────────────────
     def transfer_from_inventory(
         self,
         *,
@@ -68,6 +78,9 @@ class SellingAreaHandler(DatabaseManager):
         created_by: str,
         locid: str | None = None,
     ) -> None:
+        """
+        Move a specific inventory layer → shelf (used by older UI code).
+        """
         if locid is None:
             locid = self._lookup_locid(itemid)
             if locid is None:
@@ -80,7 +93,7 @@ class SellingAreaHandler(DatabaseManager):
                     """
                     UPDATE inventory
                        SET quantity = quantity - %s
-                     WHERE itemid = %s
+                     WHERE itemid         = %s
                        AND expirationdate = %s
                        AND cost_per_unit  = %s
                        AND quantity      >= %s
@@ -100,7 +113,9 @@ class SellingAreaHandler(DatabaseManager):
                     created_by=created_by,
                 )
 
+    # ───────────────────── generic DB helpers ────────────────────────
     def fetch_data(self, sql: str, params: tuple = ()) -> pd.DataFrame:
+        # pandas warns because psycopg2 is not officially “supported”; ignore.
         with self.conn:
             return pd.read_sql_query(sql, self.conn, params=params)
 
@@ -109,6 +124,7 @@ class SellingAreaHandler(DatabaseManager):
             with self.conn.cursor() as cur:
                 cur.execute(sql, params)
 
+    # ─────────────── shelf_shortage resolution (unchanged) ────────────
     def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
         rows = self.fetch_data(
             """
@@ -144,9 +160,10 @@ class SellingAreaHandler(DatabaseManager):
             remaining -= take
         return remaining
 
+    # ───────────────── existing KPI convenience (unchanged) ─────────────────
     def get_items_below_shelfthreshold(self) -> pd.DataFrame:
         """
-        Returns only items whose current shelf quantity is below their threshold.
+        Returns items whose current shelf quantity is below their threshold.
         """
         df = self.fetch_data(
             """
@@ -168,7 +185,7 @@ class SellingAreaHandler(DatabaseManager):
             ].astype(int)
         return df
 
-    # ────────────────────── BULK‑MODE HELPERS ───────────────────────
+    # ───────────────────── BULK‑MODE HELPERS ──────────────────────
     def items_needing_refill(self) -> pd.DataFrame:
         """
         itemid • need • locid for every SKU below threshold/average.
@@ -188,15 +205,16 @@ class SellingAreaHandler(DatabaseManager):
             SELECT k.itemid,
                    GREATEST(k.shelfaverage   - k.on_shelf,
                             k.shelfthreshold - k.on_shelf) AS need,
-                   COALESCE(sl.locid,'UNASSIGNED')         AS locid
+                   COALESCE(sl.locid,%s)                    AS locid
             FROM   kpi k
             LEFT   JOIN item_slot sl USING (itemid)
             WHERE  GREATEST(k.shelfaverage   - k.on_shelf,
                             k.shelfthreshold - k.on_shelf) > 0
-            """
+            """,
+            (DEFAULT_LOCID,),
         )
 
-    def layers_for_items(self, item_ids: list[int]) -> pd.DataFrame:
+    def layers_for_items(self, item_ids: List[int]) -> pd.DataFrame:
         """
         All positive‑stock layers for the given items, sorted FIFO.
         """
@@ -214,54 +232,85 @@ class SellingAreaHandler(DatabaseManager):
         self, need_df: pd.DataFrame, layers_df: pd.DataFrame
     ) -> List[Tuple]:
         """
-        Decide how much to pull from each layer and aggregate duplicates.
-        Returns UNIQUE tuples:
-        (itemid, exp, cpu, take_qty, locid)
+        Decide how much to pull from each layer and **aggregate duplicates** so
+        that every (itemid, exp, cpu, locid) appears only once.
         """
         need_left   = dict(zip(need_df.itemid, need_df.need))
         loc_by_item = dict(zip(need_df.itemid, need_df.locid))
 
-        # first pass may contain duplicates
+        # first pass: may yield duplicates
         raw: List[Tuple] = []
         for lyr in layers_df.itertuples(index=False):
             needed = need_left.get(lyr.itemid, 0)
             if needed <= 0:
                 continue
-            take = min(needed, lyr.quantity)
+            take = min(needed, int(lyr.quantity))
             raw.append(
                 (lyr.itemid, lyr.expirationdate, lyr.cost_per_unit,
                  take, loc_by_item[lyr.itemid])
             )
             need_left[lyr.itemid] -= take
 
-        # aggregate duplicates to avoid ON‑CONFLICT collisions inside VALUES
+        # collapse duplicates (keyed by 4‑tuple)
         agg: defaultdict[Tuple[int, Any, float, str], int] = defaultdict(int)
         for itemid, exp, cpu, qty, loc in raw:
             agg[(itemid, exp, cpu, loc)] += qty
 
-        # back to list[tuple] in final order
-        picks = [(k[0], k[1], k[2], q, k[3]) for k, q in agg.items()]
-        return picks
+        return [(k[0], k[1], k[2], q, k[3]) for k, q in agg.items()]
 
-    # ───────────────────── ONE‑SHOT REFILL (BULK) ─────────────────────
+    # ────────────────────── BULK ONE‑SHOT REFILL ──────────────────────
     def bulk_refill(self, *, user: str = "AUTO‑SHELF") -> int:
         """
-        Refills *all* items below threshold in one transaction.
-        Returns number of inventory rows moved to shelf.
+        Refills *all* items below threshold in one atomic transaction.
+        Returns number of inventory layers moved to shelf.
         """
         need_df = self.items_needing_refill()
         if need_df.empty:
             return 0
 
         layers_df = self.layers_for_items(need_df.itemid.tolist())
-        picks     = self._plan_picks(need_df, layers_df)
+        picks = self._plan_picks(need_df, layers_df)
         if not picks:
             return 0
 
-        self._ensure_live_conn()          # keep-alive
+        self._ensure_live_conn()
         cur = self.conn.cursor()
         try:
-            # 1️⃣  decrement inventory
+            # 0️⃣  keep sequence aligned with MAX(shelfid)
+            cur.execute(
+                """
+                SELECT setval(
+                    'shelf_shelfid_seq',
+                    GREATEST(
+                        (SELECT COALESCE(MAX(shelfid),0) FROM shelf) + 1,
+                        nextval('shelf_shelfid_seq')
+                    ),
+                    FALSE
+                );
+                """
+            )
+
+            # optional JSON batch dump for debugging (SHELF_DEBUG=1)
+            if os.getenv("SHELF_DEBUG") == "1":
+                logging.warning(
+                    "Bulk‑refill picks:\n%s",
+                    json.dumps(
+                        [
+                            {
+                                "itemid": p[0],
+                                "exp":    str(p[1]),
+                                "cpu":    float(p[2]),
+                                "qty":    int(p[3]),
+                                "locid":  p[4],
+                            }
+                            for p in picks
+                        ],
+                        indent=2,
+                        default=str,
+                    ),
+                )
+
+            # 1️⃣  decrement inventory quantities
             execute_values(
                 cur,
                 """
@@ -276,7 +325,7 @@ class SellingAreaHandler(DatabaseManager):
                 picks,
             )
 
-            # 2️⃣  upsert into shelf
+            # 2️⃣  upsert or update shelf
             execute_values(
                 cur,
                 """
@@ -292,7 +341,7 @@ class SellingAreaHandler(DatabaseManager):
                 [(p[0], p[1], p[2], p[3], p[4]) for p in picks],
             )
 
-            # 3️⃣  audit into shelfentries
+            # 3️⃣  audit trail
             execute_values(
                 cur,
                 """
