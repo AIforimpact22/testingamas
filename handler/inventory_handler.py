@@ -1,12 +1,13 @@
 """
 InventoryHandler – bulk‑refills warehouse stock
-(batch‑safe edition, 2025‑07‑24 / seq‑sync v3)
+(full seq‑sync edition, 2025‑07‑24)
 
-• Keeps all three related sequences in‑sync:
-    purchaseorders_poid_seq
-    purchaseorderitems_poitemid_seq
-    poitemcost_costid_seq
-  so duplicate‑key errors cannot occur.
+• Keeps every sequence in‑sync with its table’s MAX(primary_key):
+      purchaseorders_poid_seq
+      purchaseorderitems_poitemid_seq
+      poitemcost_costid_seq
+      inventory_batchid_seq
+  preventing duplicate‑key violations under any restart/migration scenario.
 """
 
 from __future__ import annotations
@@ -32,8 +33,7 @@ class InventoryHandler(DatabaseManager):
     # ---------- generic seq‑sync helper ------------------------------------
     def _sync_sequence(self, cur, seq: str, table: str, pk: str) -> None:
         cur.execute(f"SELECT COALESCE(MAX({pk}),0) FROM {table}")
-        max_val = cur.fetchone()[0]
-        cur.execute("SELECT setval(%s, %s, true)", (seq, max_val))
+        cur.execute("SELECT setval(%s, %s, true)", (seq, cur.fetchone()[0]))
 
     # ---------- snapshot ---------------------------------------------------
     def stock_levels(self) -> pd.DataFrame:
@@ -106,26 +106,19 @@ class InventoryHandler(DatabaseManager):
         po_rows   = [(poid, it, q, q, cpu) for it, q, cpu in items]
         cost_rows = [(poid, it, cpu, q, "Auto Refill") for it, q, cpu in items]
 
-        with self.conn.cursor() as cur:
-            # Sync sequences ONCE before attempting bulk inserts
-            self._sync_sequence(
-                cur,
-                "purchaseorderitems_poitemid_seq",
-                "purchaseorderitems",
-                "poitemid",
-            )
-            self._sync_sequence(
-                cur,
-                "poitemcost_costid_seq",
-                "poitemcost",
-                "costid",
-            )
-            self.conn.commit()
-
         for attempt in (1, 2):
             try:
                 with self.conn:
                     with self.conn.cursor() as cur:
+                        # ensure sequences ahead **before** attempting inserts
+                        self._sync_sequence(
+                            cur, "purchaseorderitems_poitemid_seq",
+                            "purchaseorderitems", "poitemid"
+                        )
+                        self._sync_sequence(
+                            cur, "poitemcost_costid_seq",
+                            "poitemcost", "costid"
+                        )
                         execute_values(
                             cur,
                             """
@@ -153,10 +146,8 @@ class InventoryHandler(DatabaseManager):
                 if attempt == 1:
                     with self.conn.cursor() as cur2:
                         self._sync_sequence(
-                            cur2,
-                            "poitemcost_costid_seq",
-                            "poitemcost",
-                            "costid",
+                            cur2, "poitemcost_costid_seq",
+                            "poitemcost", "costid"
                         )
                         self.conn.commit()
                 else:
@@ -171,18 +162,42 @@ class InventoryHandler(DatabaseManager):
             (it, qty, FIX_EXPIRY, FIX_WH_LOC, cpu, poid, cid)
             for it, qty, cpu, poid, cid in rows
         ]
-        with self.conn:
-            with self.conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO inventory
-                          (itemid,quantity,expirationdate,storagelocation,
-                           cost_per_unit,poid,costid)
-                    VALUES %s
-                    """,
-                    inv_rows,
-                )
+        for attempt in (1, 2):
+            try:
+                with self.conn:
+                    with self.conn.cursor() as cur:
+                        # sync batchid sequence once before first attempt
+                        if attempt == 1:
+                            self._sync_sequence(
+                                cur,
+                                "inventory_batchid_seq",
+                                "inventory",
+                                "batchid",
+                            )
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO inventory
+                                  (itemid,quantity,expirationdate,storagelocation,
+                                   cost_per_unit,poid,costid)
+                            VALUES %s
+                            """,
+                            inv_rows,
+                        )
+                        return
+            except pgerr.UniqueViolation:
+                if attempt == 1:
+                    # another process inserted between sync and commit – resync
+                    with self.conn.cursor() as cur2:
+                        self._sync_sequence(
+                            cur2,
+                            "inventory_batchid_seq",
+                            "inventory",
+                            "batchid",
+                        )
+                        self.conn.commit()
+                else:
+                    raise
 
     # ---------- public API -------------------------------------------------
     def restock_items_bulk(
