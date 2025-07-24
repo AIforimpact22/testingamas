@@ -211,4 +211,40 @@ class POSHandler(DatabaseManager):
         return sale_df, items_df
 
     # ---- Held‑bill helpers unchanged ----------------------------------
-    # save_hold / load_hold / delete_hold …
+ # ---- Held‑bill helpers (unchanged) --------------------------------
+    def save_hold(self, *, cashier_id: str, label: str,
+                  df_items: pd.DataFrame) -> int:
+        payload = df_items[["itemid", "itemname",
+                            "quantity", "price"]].to_dict("records")
+        hold_id = self.execute_command_returning(
+            """
+            INSERT INTO pos_holds (hold_label, cashier_id, items)
+            VALUES (%s, %s, %s::jsonb)
+            RETURNING holdid
+            """,
+            (label, cashier_id, json.dumps(payload)),
+        )[0]
+        return int(hold_id)
+
+    def load_hold(self, hold_id: int) -> pd.DataFrame:
+        js = self.fetch_data("SELECT items FROM pos_holds WHERE holdid=%s",
+                             (hold_id,))
+        if js.empty:
+            raise ValueError("Hold not found")
+        data = js.iat[0, 0]
+        rows = json.loads(data) if isinstance(data, str) else data
+        df   = pd.DataFrame(rows)
+
+        if "itemname" not in df.columns:
+            ids = df["itemid"].tolist()
+            q   = "SELECT itemid,itemnameenglish FROM item WHERE itemid IN %s"
+            names = self.fetch_data(q, (tuple(ids),)).set_index("itemid")\
+                                                    ["itemnameenglish"].to_dict()
+            df["itemname"] = df["itemid"].map(names).fillna("Unknown")
+
+        df["total"] = df["quantity"] * df["price"]
+        return df[["itemid", "itemname", "quantity", "price", "total"]]
+
+    def delete_hold(self, hold_id: int) -> None:
+        self.execute_command("DELETE FROM pos_holds WHERE holdid=%s",
+                             (hold_id,))
