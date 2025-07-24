@@ -1,10 +1,9 @@
 """
-InventoryHandler – bulk‑refills warehouse stock
+InventoryHandler – bulk‑refills warehouse stock
 (batch‑safe edition, 2025‑07‑24)
 
-• Guarantees the purchase‑orders sequence is ahead of MAX(poid)
+• Guarantees the purchase‑orders sequence is always ahead of MAX(poid)
   so inserts never collide with existing keys.
-• Public API and data‑shape unchanged.
 """
 
 from __future__ import annotations
@@ -27,11 +26,11 @@ FIX_WH_LOC          = "A2"
 
 
 class InventoryHandler(DatabaseManager):
-    # ───────────────────────── snapshot helpers ──────────────────────
+    # ───────────── snapshot ─────────────
     def stock_levels(self) -> pd.DataFrame:
         inv = self.fetch_data(
             "SELECT itemid, SUM(quantity)::int AS totalqty "
-            "FROM   inventory GROUP BY itemid"
+            "FROM inventory GROUP BY itemid"
         )
         if inv.empty:
             inv = pd.DataFrame(columns=["itemid", "totalqty"])
@@ -43,14 +42,14 @@ class InventoryHandler(DatabaseManager):
                    COALESCE(threshold,       {DEFAULT_THRESHOLD}) AS threshold,
                    COALESCE(averagerequired, {DEFAULT_AVERAGE})   AS average,
                    COALESCE(sellingprice,0)                     AS sellingprice
-            FROM   item
+            FROM item
             """
         )
         df = meta.merge(inv, on="itemid", how="left")
         df["totalqty"] = df["totalqty"].fillna(0).astype(int)
         return df
 
-    # ───────────────────────── misc helpers ──────────────────────────
+    # ───────────── helpers ─────────────
     def supplier_for(self, itemid: int) -> int:
         res = self.fetch_data(
             "SELECT supplierid FROM itemsupplier WHERE itemid=%s LIMIT 1",
@@ -58,22 +57,16 @@ class InventoryHandler(DatabaseManager):
         )
         return GENERIC_SUPPLIER_ID if res.empty else int(res.iloc[0, 0])
 
-    # ---- NEW: keep sequence ahead of existing POIDs -----------------
+    # -- keep purchaseorders_poid_seq ahead of MAX(poid) ----------------
     def _sync_po_sequence(self, cur) -> None:
         cur.execute("SELECT MAX(poid) FROM purchaseorders")
         max_poid = cur.fetchone()[0] or 0
-        # Set sequence *to* max (nextval will return max+1)
         cur.execute(
-            "SELECT setval('purchaseorders_poid_seq', %s, true)",
-            (max_poid,),
+            "SELECT setval('purchaseorders_poid_seq', %s, true)", (max_poid,)
         )
 
-    # -----------------------------------------------------------------
     def _create_po(self, supplier_id: int) -> int:
-        """
-        Inserts a Completed purchase‑order and returns its poid.
-        Guarantees sequence sync even if someone inserted manual IDs.
-        """
+        """Insert a Completed PO; sync sequence on the fly if needed."""
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
             try:
@@ -92,10 +85,9 @@ class InventoryHandler(DatabaseManager):
                 self.conn.commit()
                 return int(poid)
             except pgerr.UniqueViolation:
-                # Sequence lagged behind – fix and retry once
                 self.conn.rollback()
                 self._sync_po_sequence(cur)
-                self.conn.commit()           # commit the setval
+                self.conn.commit()
                 with self.conn.cursor() as cur2:
                     cur2.execute(
                         """
@@ -112,7 +104,6 @@ class InventoryHandler(DatabaseManager):
                     self.conn.commit()
                     return int(poid)
 
-    # -----------------------------------------------------------------
     def _add_lines_and_costs(
         self, poid: int, items: List[Tuple[int, int, float]]
     ) -> List[int]:
@@ -165,19 +156,13 @@ class InventoryHandler(DatabaseManager):
                     inv_rows,
                 )
 
-    # ───────────────────────── public API ────────────────────────────
+    # ───────────── public API ─────────────
     def restock_items_bulk(
         self,
         df_need: pd.DataFrame,
         *,
         debug: bool = False,
     ) -> Dict[str, Any]:
-        """
-        If *debug* → returns dict with keys:
-          log         – normal action log
-          by_supplier – {supplier_id: DataFrame_of_items}
-        Else returns {'log': …}
-        """
         df_need = df_need.copy()
         df_need["supplier"] = df_need["itemid"].apply(self.supplier_for)
 
@@ -190,7 +175,8 @@ class InventoryHandler(DatabaseManager):
                 (
                     int(r.itemid),
                     int(r.need),
-                    round(float(r.sellingprice) * 0.75, 2) if r.sellingprice else 0.0,
+                    round(float(r.sellingprice) * 0.75, 2)
+                    if r.sellingprice else 0.0,
                 )
                 for _, r in grp.iterrows()
             ]
@@ -204,7 +190,8 @@ class InventoryHandler(DatabaseManager):
 
             for (it, qty, cpu), cid in zip(items, cost_ids):
                 log.append(
-                    dict(itemid=it, added=qty, cpu=cpu, poid=poid, costid=cid)
+                    dict(itemid=it, added=qty, cpu=cpu,
+                         poid=poid, costid=cid)
                 )
 
             if debug:
