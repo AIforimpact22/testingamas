@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any
+from typing import Sequence
 
 import pandas as pd
 from psycopg2 import extensions as _psx
@@ -13,6 +13,9 @@ class SellingAreaHandler(DatabaseManager):
     # ────────────────────── small helpers ──────────────────────
     @lru_cache(maxsize=10_000)
     def _lookup_locid(self, itemid: int) -> str | None:
+        """
+        Cache item‑slot mapping for speed: itemid ➜ locid
+        """
         df = self.fetch_data(
             "SELECT locid FROM item_slot WHERE itemid = %s LIMIT 1", (itemid,)
         )
@@ -46,7 +49,34 @@ class SellingAreaHandler(DatabaseManager):
             """
         )
 
-    # ─────────────────── internal upsert helper ────────────────────
+    # ─────────────────── internal low‑level helpers ────────────────────
+    def _decrement_inventory_layer(
+        self,
+        *,
+        cur,
+        itemid: int,
+        expirationdate,
+        quantity: int,
+        cost_per_unit: float,
+    ) -> None:
+        """
+        UPDATE a single inventory cost layer **using the caller’s cursor**.
+        Keeps row‑level locking local to the outer transaction.
+        """
+        cur.execute(
+            """
+            UPDATE inventory
+               SET quantity = quantity - %s
+             WHERE itemid         = %s
+               AND expirationdate = %s
+               AND cost_per_unit  = %s
+               AND quantity      >= %s
+            """,
+            (quantity, itemid, expirationdate, cost_per_unit, quantity),
+        )
+        if cur.rowcount == 0:
+            raise ValueError("Insufficient inventory layer")
+
     def _upsert_shelf_layer(
         self,
         *,
@@ -58,6 +88,10 @@ class SellingAreaHandler(DatabaseManager):
         locid: str,
         created_by: str,
     ) -> None:
+        """
+        UPSERT into `shelf` **and** append to `shelfentries`
+        using the caller’s cursor.
+        """
         cur.execute(
             """
             INSERT INTO shelf
@@ -79,52 +113,53 @@ class SellingAreaHandler(DatabaseManager):
             (itemid, expirationdate, quantity, created_by, locid),
         )
 
-    # ───────────────────── public API ─────────────────────
-    def transfer_from_inventory(
+    # ───────────────────── new bulk mover ─────────────────────
+    def move_layers_to_shelf(
         self,
         *,
         itemid: int,
-        expirationdate,
-        quantity: int,
-        cost_per_unit: float,
+        layers: Sequence[tuple],  # (expirationdate, quantity, cost_per_unit)
         created_by: str,
         locid: str | None = None,
     ) -> None:
         """
-        Moves stock from the warehouse `inventory` table onto the selling‑area
-        `shelf`, preserving FIFO costs and writing an audit entry.
+        Atomically move **one or more** FIFO layers from warehouse
+        inventory to shelf for a single item.
+
+        layers example:
+            [
+              (date(2025,10,31),  6,  4.10),
+              (date(2025,11,15), 12,  4.25),
+            ]
         """
+        if not layers:
+            return
+
         if locid is None:
             locid = self._lookup_locid(itemid)
             if locid is None:
                 raise ValueError(f"No slot mapping for item {itemid}")
 
         self._ensure_live_conn()
-        with self.conn:                       # single, outer transaction
+        with self.conn:           # one outer transaction for the whole item
             with self.conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE inventory
-                       SET quantity = quantity - %s
-                     WHERE itemid = %s
-                       AND expirationdate = %s
-                       AND cost_per_unit  = %s
-                       AND quantity      >= %s
-                    """,
-                    (quantity, itemid, expirationdate, cost_per_unit, quantity),
-                )
-                if cur.rowcount == 0:
-                    raise ValueError("Insufficient inventory layer")
-
-                self._upsert_shelf_layer(
-                    cur=cur,
-                    itemid=itemid,
-                    expirationdate=expirationdate,
-                    quantity=quantity,
-                    cost_per_unit=cost_per_unit,
-                    locid=locid,
-                    created_by=created_by,
-                )
+                for exp, qty, cpu in layers:
+                    self._decrement_inventory_layer(
+                        cur=cur,
+                        itemid=itemid,
+                        expirationdate=exp,
+                        quantity=qty,
+                        cost_per_unit=cpu,
+                    )
+                    self._upsert_shelf_layer(
+                        cur=cur,
+                        itemid=itemid,
+                        expirationdate=exp,
+                        quantity=qty,
+                        cost_per_unit=cpu,
+                        locid=locid,
+                        created_by=created_by,
+                    )
 
     # ────────────────── generic DB wrappers (recursion‑safe) ─────────────────
     def fetch_data(self, sql: str, params: tuple = ()) -> pd.DataFrame:
