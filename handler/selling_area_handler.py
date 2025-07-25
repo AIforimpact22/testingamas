@@ -4,6 +4,7 @@ from functools import lru_cache
 from typing import Sequence
 
 import pandas as pd
+import warnings
 from psycopg2 import extensions as _psx
 
 from db_handler import DatabaseManager
@@ -165,9 +166,16 @@ class SellingAreaHandler(DatabaseManager):
     def fetch_data(self, sql: str, params: tuple = ()) -> pd.DataFrame:
         """
         Read helper that never opens a nested connection context.
+        Suppresses the harmless “pandas only supports SQLAlchemy …” warning.
         """
         self._ensure_live_conn()
-        return pd.read_sql_query(sql, self.conn, params=params)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=UserWarning,
+                message="pandas only supports SQLAlchemy connectable",
+            )
+            return pd.read_sql_query(sql, self.conn, params=params)
 
     def execute_command(self, sql: str, params: tuple = ()) -> None:
         """
@@ -181,7 +189,8 @@ class SellingAreaHandler(DatabaseManager):
             cur.execute(sql, params)
         finally:
             cur.close()
-            if self.conn.get_transaction_status() == _psx.STATUS_IDLE:
+            # FIX: psycopg2 uses TRANSACTION_STATUS_IDLE
+            if self.conn.get_transaction_status() == _psx.TRANSACTION_STATUS_IDLE:
                 self.conn.commit()
 
     # ───────────────── shortage reconciliation ──────────────────
