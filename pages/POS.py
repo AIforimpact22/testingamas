@@ -1,7 +1,7 @@
 from __future__ import annotations
 """
 🛒 POS + Inventory + Shelf automation – parallel cashiers with live debug tabs
-(batch‑insert edition, 2025‑07‑24)
+(batch‑insert edition, 2025‑07‑26)
 """
 
 import random
@@ -110,7 +110,6 @@ POS   = POSHandler()
 INV   = InventoryHandler()
 SHELF = SellingAreaHandler()
 
-
 @st.cache_data(ttl=600, show_spinner=False)
 def catalogue() -> pd.DataFrame:
     return POS.fetch_data(
@@ -120,7 +119,6 @@ def catalogue() -> pd.DataFrame:
          WHERE sellingprice IS NOT NULL AND sellingprice > 0
         """
     )
-
 
 CAT = catalogue()
 
@@ -174,63 +172,77 @@ def inventory_cycle() -> int:
 
 
 def shelf_cycle() -> int:
-    meta = SHELF.get_all_items().set_index("itemid")
-    kpi  = SHELF.get_shelf_quantity_by_item().set_index("itemid")
-    df   = meta.join(kpi, how="left").fillna({"totalquantity": 0})
-    df["totalquantity"] = df.totalquantity.astype(int)
-    below = df[df.totalquantity < df.shelfthreshold]
-    moved, sh_log = 0, []
-    for itemid, row in below.iterrows():
-        thresh, avg, current = (
-            row.shelfthreshold,
-            row.shelfaverage,
-            row.totalquantity,
-        )
-        need = max(avg - current, thresh - current)
-        need = SHELF.resolve_shortages(itemid=itemid, qty_need=need, user="AUTO‑UNIFIED")
+    """
+    Uses the **exact same refill mechanics** as the dedicated 'Shelf Auto‑Refill'
+    page, but runs silently inside the unified POS loop.
+    Returns the number of items that were topped‑up this pass.
+    """
+    below = SHELF.get_items_below_shelfthreshold()
+    if below.empty:
+        return 0
+
+    moved_items = 0
+    log_entries = []
+    USER = "AUTO‑UNIFIED"
+    DUMMY_SALEID = 0
+
+    for row in below.itertuples(index=False):
+        # How many units do we need?
+        need = max(row.shelfaverage - row.totalquantity,
+                   row.shelfthreshold - row.totalquantity)
+
+        # Clear historical shortages first
+        need = SHELF.resolve_shortages(itemid=row.itemid, qty_need=need, user=USER)
         if need <= 0:
             continue
+
         layers = SHELF.fetch_data(
             """
             SELECT expirationdate, quantity, cost_per_unit
               FROM inventory
-             WHERE itemid=%s AND quantity>0
+             WHERE itemid = %s AND quantity > 0
           ORDER BY expirationdate, cost_per_unit
             """,
-            (itemid,),
+            (row.itemid,),
         )
+
+        plan = []
         for lyr in layers.itertuples():
+            if need == 0:
+                break
             take = min(need, int(lyr.quantity))
-            SHELF.transfer_from_inventory(
-                itemid=itemid,
-                expirationdate=lyr.expirationdate,
-                quantity=take,
-                cost_per_unit=float(lyr.cost_per_unit),
-                created_by="AUTO‑UNIFIED",
+            if take:
+                plan.append((lyr.expirationdate, take, float(lyr.cost_per_unit)))
+                need -= take
+
+        if plan:
+            SHELF.move_layers_to_shelf(
+                itemid=row.itemid,
+                layers=plan,
+                created_by=USER,
             )
-            need  -= take
-            moved += take
-            sh_log.append(
+            moved_items += 1
+            log_entries.append(
                 dict(
-                    itemid=itemid,
+                    itemid=row.itemid,
                     itemname=row.itemname,
-                    quantity=take,
+                    layers=len(plan),
                     timestamp=datetime.now().strftime("%F %T"),
                 )
             )
-            if need == 0:
-                break
+
         if need > 0:
             SHELF.execute_command(
                 """
                 INSERT INTO shelf_shortage
                       (saleid, itemid, shortage_qty, logged_at)
-                VALUES (0,%s,%s,CURRENT_TIMESTAMP)
+                VALUES (%s,%s,%s,CURRENT_TIMESTAMP)
                 """,
-                (itemid, need),
+                (DUMMY_SALEID, row.itemid, need),
             )
-    st.session_state.sh_all_logs.extend(sh_log)
-    return moved
+
+    st.session_state.sh_all_logs.extend(log_entries)
+    return moved_items  #  how many different items were refilled
 
 
 # ───────────── MAIN LOOP ─────────────
@@ -299,7 +311,7 @@ if RUN:
     with col2:
         st.subheader("Automation")
         st.metric("Inv rows last",   st.session_state.last_inv_rows)
-        st.metric("Shelf qty moved", st.session_state.last_sh_rows)
+        st.metric("Shelf items refilled", st.session_state.last_sh_rows)
 
     st.progress(
         (now_real - st.session_state.inv_last_ts) / INV_SEC,
