@@ -9,10 +9,12 @@ Bulk‑commit POS baskets, with optional `lastupdate` stamping on the
 from __future__ import annotations
 
 import json
+import warnings                              # NEW
 from datetime import datetime
 from typing import Any, Dict, List
 
 import pandas as pd
+from psycopg2 import extensions as _psx
 from psycopg2.extras import execute_values
 
 from db_handler import DatabaseManager
@@ -30,6 +32,56 @@ class POSHandler(DatabaseManager):
             """
         )
         return cur.fetchone() is not None
+
+    # ────────────────────── Generic DB wrappers (patched) ─────────────
+    def fetch_data(self, sql: str, params: tuple = ()) -> pd.DataFrame:
+        """
+        Read helper identical to the one in SellingAreaHandler—
+        silences the harmless pandas/SQLAlchemy warning.
+        """
+        self._ensure_live_conn()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=UserWarning,
+                message="pandas only supports SQLAlchemy connectable",
+            )
+            return pd.read_sql_query(sql, self.conn, params=params)
+
+    def execute_command(self, sql: str, params: tuple = ()) -> None:
+        """
+        Write helper that commits immediately when not inside an explicit
+        transaction.  Uses the correct psycopg2 constant.
+        """
+        self._ensure_live_conn()
+        cur = self.conn.cursor()
+        try:
+            cur.execute(sql, params)
+        finally:
+            cur.close()
+            if (
+                self.conn.get_transaction_status()
+                == _psx.TRANSACTION_STATUS_IDLE  # ← fixed
+            ):
+                self.conn.commit()
+
+    def execute_command_returning(self, sql: str, params: tuple = ()) -> list:
+        """
+        Same idea as execute_command, but returns cursor.fetchone().
+        """
+        self._ensure_live_conn()
+        cur = self.conn.cursor()
+        try:
+            cur.execute(sql, params)
+            res = cur.fetchone()
+        finally:
+            cur.close()
+            if (
+                self.conn.get_transaction_status()
+                == _psx.TRANSACTION_STATUS_IDLE
+            ):
+                self.conn.commit()
+        return res
 
     # ───────────────────────── Single‑sale helper ─────────────────────
     def create_sale_record(
@@ -145,8 +197,10 @@ class POSHandler(DatabaseManager):
                         take = min(remain, layer_qty)
 
                         if take == layer_qty:  # delete whole layer
-                            cur.execute("DELETE FROM shelf WHERE shelfid=%s",
-                                        (shelfid,))
+                            cur.execute(
+                                "DELETE FROM shelf WHERE shelfid=%s",
+                                (shelfid,),
+                            )
                         else:                  # partial layer
                             if shelf_has_lastupdate:
                                 cur.execute(
@@ -160,8 +214,11 @@ class POSHandler(DatabaseManager):
                                 )
                             else:
                                 cur.execute(
-                                    "UPDATE shelf SET quantity = quantity - %s "
-                                    "WHERE shelfid = %s",
+                                    """
+                                    UPDATE shelf
+                                       SET quantity = quantity - %s
+                                     WHERE shelfid  = %s
+                                    """,
                                     (take, shelfid),
                                 )
                         remain -= take
@@ -209,7 +266,11 @@ class POSHandler(DatabaseManager):
             if shortage_rows:
                 execute_values(
                     cur,
-                    "INSERT INTO shelf_shortage (saleid,itemid,shortage_qty) VALUES %s",
+                    """
+                    INSERT INTO shelf_shortage
+                          (saleid, itemid, shortage_qty)
+                    VALUES %s
+                    """,
                     shortage_rows,
                 )
 
