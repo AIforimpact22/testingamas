@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-🗄️ Shelf Auto‑Refill – Optimized, Progress & Refilled Tab, with End-of-Run Notification
+🗄️ Shelf Auto‑Refill – faster single‑transaction version
 """
 
 import time
@@ -50,14 +50,13 @@ handler = SellingAreaHandler()
 USER = "AUTO‑SHELF"
 DUMMY_SALEID = 0     # unchanged
 
-# ─────────── refill logic, optimized ───────────
+# ─────────── refill logic (single‑transaction per item) ───────────
 def refill_item(
     *,
     itemid: int,
     current_qty: int,
     meta,
 ) -> str:
-    # Fixed: meta is always a namedtuple from itertuples(), use attributes only!
     threshold = meta.shelfthreshold
     average   = meta.shelfaverage
     if current_qty >= threshold:
@@ -65,12 +64,13 @@ def refill_item(
 
     need = max(average - current_qty, threshold - current_qty)
 
-    # resolve open shortages
+    # resolve open shortages first
     need = handler.resolve_shortages(itemid=itemid, qty_need=need, user=USER)
     if need <= 0:
         return "Shortage cleared"
 
-    layers = handler.fetch_data(
+    # FIFO layers still available in inventory
+    layers_df = handler.fetch_data(
         """
         SELECT expirationdate, quantity, cost_per_unit
           FROM inventory
@@ -79,29 +79,37 @@ def refill_item(
         """,
         (itemid,),
     )
-    for lyr in layers.itertuples():
+
+    plan: list[tuple] = []   # (expirationdate, take_qty, cost_per_unit)
+    for lyr in layers_df.itertuples():
+        if need == 0:
+            break
         take = min(need, int(lyr.quantity))
-        handler.transfer_from_inventory(
+        if take:
+            plan.append((lyr.expirationdate, take, float(lyr.cost_per_unit)))
+            need -= take
+
+    # Execute plan as **one** transaction
+    if plan:
+        handler.move_layers_to_shelf(
             itemid=itemid,
-            expirationdate=lyr.expirationdate,
-            quantity=take,
-            cost_per_unit=float(lyr.cost_per_unit),
+            layers=plan,
             created_by=USER,
         )
-        need -= take
-        if need == 0:
-            return "Refilled"
 
-    # not enough inventory – log shortage
-    handler.execute_command(
-        """
-        INSERT INTO shelf_shortage
-              (saleid, itemid, shortage_qty, logged_at)
-        VALUES (%s,%s,%s,CURRENT_TIMESTAMP)
-        """,
-        (DUMMY_SALEID, itemid, need),
-    )
-    return f"Partial (short {need})"
+    # If not fully satisfied, record shortage
+    if need > 0:
+        handler.execute_command(
+            """
+            INSERT INTO shelf_shortage
+                  (saleid, itemid, shortage_qty, logged_at)
+            VALUES (%s,%s,%s,CURRENT_TIMESTAMP)
+            """,
+            (DUMMY_SALEID, itemid, need),
+        )
+        return f"Partial (short {need})"
+
+    return "Refilled"
 
 # ─────────── main refill cycle ───────────
 def run_cycle() -> list[dict]:
@@ -135,7 +143,6 @@ def run_cycle() -> list[dict]:
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         log.append(log_entry)
-        # Only record real refill events (not just 'OK')
         if action in ("Refilled", "Shortage cleared") or action.startswith("Partial"):
             refilled.append(log_entry)
         step_bar.progress(i / n, text=f"Processed {i}/{n}")
@@ -164,7 +171,9 @@ if st.session_state.running:
             # After each run, show a notification with the refill results
             refilled_count = st.session_state.last_refilled_count
             if refilled_count > 0:
-                notify_placeholder.success(f"Cycle complete! {refilled_count} item(s) refilled/updated this run.")
+                notify_placeholder.success(
+                    f"Cycle complete! {refilled_count} item(s) refilled/updated this run."
+                )
             else:
                 notify_placeholder.info("Cycle complete! No items needed refilling this run.")
             time.sleep(2.0)  # Show notification briefly before rerun
@@ -177,7 +186,7 @@ if st.session_state.running:
         st.session_state.cycles += 1
         rem = SECONDS
 
-    # metrics
+    # ─────────── metrics & logs ───────────
     cc1, cc2, cc3 = st.columns(3)
     cc1.metric("Cycles",     st.session_state.cycles)
     cc2.metric("Processed",  len(st.session_state.last_log))
@@ -188,29 +197,25 @@ if st.session_state.running:
 
     st.progress(1 - rem / SECONDS, text=f"Next cycle in {int(rem)} s")
 
-    # ─────────── TABS FOR LOGS ───────────
     tab1, tab2, tab3 = st.tabs(["Current Cycle", "All Actions (History)", "Refilled This Session"])
     with tab1:
         st.subheader("Last cycle log")
         if st.session_state.last_log:
-            st.dataframe(pd.DataFrame(st.session_state.last_log),
-                         use_container_width=True)
+            st.dataframe(pd.DataFrame(st.session_state.last_log), use_container_width=True)
         else:
             st.write("— nothing this time —")
 
     with tab2:
         st.subheader("All actions this session (history)")
         if st.session_state.history_log:
-            st.dataframe(pd.DataFrame(st.session_state.history_log),
-                         use_container_width=True)
+            st.dataframe(pd.DataFrame(st.session_state.history_log), use_container_width=True)
         else:
             st.write("— no actions yet —")
 
     with tab3:
         st.subheader("Successfully Refilled/Updated")
         if st.session_state.refilled_log:
-            st.dataframe(pd.DataFrame(st.session_state.refilled_log),
-                         use_container_width=True)
+            st.dataframe(pd.DataFrame(st.session_state.refilled_log), use_container_width=True)
         else:
             st.write("— no successful refills yet —")
 
