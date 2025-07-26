@@ -1,3 +1,4 @@
+# handler/selling_area_handler.py
 from __future__ import annotations
 
 from functools import lru_cache
@@ -14,9 +15,6 @@ class SellingAreaHandler(DatabaseManager):
     # ────────────────────── small helpers ──────────────────────
     @lru_cache(maxsize=10_000)
     def _lookup_locid(self, itemid: int) -> str | None:
-        """
-        Cache item‑slot mapping for speed: itemid ➜ locid
-        """
         df = self.fetch_data(
             "SELECT locid FROM item_slot WHERE itemid = %s LIMIT 1", (itemid,)
         )
@@ -24,9 +22,6 @@ class SellingAreaHandler(DatabaseManager):
 
     # ────────────────── PUBLIC helpers (used by POS.py) ──────────────────
     def get_all_items(self) -> pd.DataFrame:
-        """
-        Full item catalogue with shelf KPI defaults.
-        """
         return self.fetch_data(
             """
             SELECT itemid,
@@ -38,9 +33,6 @@ class SellingAreaHandler(DatabaseManager):
         )
 
     def get_shelf_quantity_by_item(self) -> pd.DataFrame:
-        """
-        Current shelf quantity aggregated by itemid.
-        """
         return self.fetch_data(
             """
             SELECT itemid,
@@ -55,28 +47,30 @@ class SellingAreaHandler(DatabaseManager):
         self,
         *,
         cur,
-        itemid: int,
-        expirationdate,
+        batchid: int,
         quantity: int,
-        cost_per_unit: float,
     ) -> None:
         """
-        UPDATE a single inventory cost layer **using the caller’s cursor**.
-        Keeps row‑level locking local to the outer transaction.
+        Subtract `quantity` from ONE specific inventory row,
+        identified by its primary key `batchid`.
         """
         cur.execute(
             """
             UPDATE inventory
                SET quantity = quantity - %s
-             WHERE itemid         = %s
-               AND expirationdate = %s
-               AND cost_per_unit  = %s
-               AND quantity      >= %s
+             WHERE batchid  = %s
+               AND quantity >= %s
             """,
-            (quantity, itemid, expirationdate, cost_per_unit, quantity),
+            (quantity, batchid, quantity),
         )
         if cur.rowcount == 0:
             raise ValueError("Insufficient inventory layer")
+
+        # Auto‑cleanup – delete empty rows so the table stays lean
+        cur.execute(
+            "DELETE FROM inventory WHERE batchid = %s AND quantity = 0",
+            (batchid,),
+        )
 
     def _upsert_shelf_layer(
         self,
@@ -89,10 +83,6 @@ class SellingAreaHandler(DatabaseManager):
         locid: str,
         created_by: str,
     ) -> None:
-        """
-        UPSERT into `shelf` **and** append to `shelfentries`
-        using the caller’s cursor.
-        """
         cur.execute(
             """
             INSERT INTO shelf
@@ -114,23 +104,23 @@ class SellingAreaHandler(DatabaseManager):
             (itemid, expirationdate, quantity, created_by, locid),
         )
 
-    # ───────────────────── new bulk mover ─────────────────────
+    # ───────────────────── bulk mover (single item) ─────────────────────
     def move_layers_to_shelf(
         self,
         *,
         itemid: int,
-        layers: Sequence[tuple],  # (expirationdate, quantity, cost_per_unit)
+        layers: Sequence[tuple],  # (batchid, expirationdate, quantity, cost_per_unit)
         created_by: str,
         locid: str | None = None,
     ) -> None:
         """
-        Atomically move **one or more** FIFO layers from warehouse
-        inventory to shelf for a single item.
+        Atomically move one‑or‑more FIFO layers from warehouse
+        inventory to shelf for **one** item.
 
-        layers example:
+        Example `layers`:
             [
-              (date(2025,10,31),  6,  4.10),
-              (date(2025,11,15), 12,  4.25),
+              (123, date(2025,10,31),  6,  4.10),
+              (124, date(2025,11,15), 12,  4.25),
             ]
         """
         if not layers:
@@ -142,15 +132,13 @@ class SellingAreaHandler(DatabaseManager):
                 raise ValueError(f"No slot mapping for item {itemid}")
 
         self._ensure_live_conn()
-        with self.conn:           # one outer transaction for the whole item
+        with self.conn:           # one outer transaction
             with self.conn.cursor() as cur:
-                for exp, qty, cpu in layers:
+                for bid, exp, qty, cpu in layers:
                     self._decrement_inventory_layer(
                         cur=cur,
-                        itemid=itemid,
-                        expirationdate=exp,
+                        batchid=bid,
                         quantity=qty,
-                        cost_per_unit=cpu,
                     )
                     self._upsert_shelf_layer(
                         cur=cur,
@@ -162,12 +150,8 @@ class SellingAreaHandler(DatabaseManager):
                         created_by=created_by,
                     )
 
-    # ────────────────── generic DB wrappers (recursion‑safe) ─────────────────
+    # ────────────────── generic DB wrappers (warning‑free) ─────────────────
     def fetch_data(self, sql: str, params: tuple = ()) -> pd.DataFrame:
-        """
-        Read helper that never opens a nested connection context.
-        Suppresses the harmless “pandas only supports SQLAlchemy …” warning.
-        """
         self._ensure_live_conn()
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -178,19 +162,16 @@ class SellingAreaHandler(DatabaseManager):
             return pd.read_sql_query(sql, self.conn, params=params)
 
     def execute_command(self, sql: str, params: tuple = ()) -> None:
-        """
-        Simple write helper that avoids `with self.conn:` to prevent
-        recursive‑connection errors when called from inside a transaction.
-        Commits immediately if not already inside an explicit transaction.
-        """
         self._ensure_live_conn()
         cur = self.conn.cursor()
         try:
             cur.execute(sql, params)
         finally:
             cur.close()
-            # FIX: psycopg2 uses TRANSACTION_STATUS_IDLE
-            if self.conn.get_transaction_status() == _psx.TRANSACTION_STATUS_IDLE:
+            if (
+                self.conn.get_transaction_status()
+                == _psx.TRANSACTION_STATUS_IDLE
+            ):
                 self.conn.commit()
 
     # ───────────────── shortage reconciliation ──────────────────
@@ -232,9 +213,6 @@ class SellingAreaHandler(DatabaseManager):
 
     # ───────────────── convenience query ─────────────────────────
     def get_items_below_shelfthreshold(self) -> pd.DataFrame:
-        """
-        Items whose shelf quantity is below their configured threshold.
-        """
         df = self.fetch_data(
             """
             SELECT i.itemid,
