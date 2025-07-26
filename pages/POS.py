@@ -1,7 +1,6 @@
 from __future__ import annotations
 """
-🛒 POS + Inventory + Shelf automation – parallel cashiers with live debug tabs
-(batch‑insert edition, 2025‑07‑26)
+🛒 POS + Inventory + Shelf automation – batchid‑safe edition (2025‑07‑26)
 """
 
 import random
@@ -17,11 +16,11 @@ from handler.POS_handler import POSHandler
 from handler.inventory_handler import InventoryHandler
 from handler.selling_area_handler import SellingAreaHandler
 
-# ───────────── UI CONFIG ─────────────
+# ───── UI CONFIG ─────
 st.set_page_config(page_title="Unified POS / Refill", page_icon="🛒")
 st.title("🛒 POS + Inventory + Shelf automation")
 
-# ───────────── SIDEBAR – POS PARAMS ─────────────
+# POS parameters ----------------------------------------------------------
 st.sidebar.header("POS parameters")
 SPEED   = st.sidebar.number_input("Speed multiplier (×)", 1, 200, 1, 1)
 PROFILE = st.sidebar.selectbox(
@@ -34,9 +33,8 @@ max_items = st.sidebar.number_input("Max items / sale", min_items, 30, 6)
 min_qty   = st.sidebar.number_input("Min qty / item", 1, 20, 1)
 max_qty   = st.sidebar.number_input("Max qty / item", min_qty, 50, 5)
 
+# automation intervals ----------------------------------------------------
 st.sidebar.header("Automation intervals")
-
-
 def _interval(label: str, default_val: int, default_unit="Minutes") -> int:
     unit = st.sidebar.selectbox(
         f"{label} unit",
@@ -49,26 +47,22 @@ def _interval(label: str, default_val: int, default_unit="Minutes") -> int:
     )
     return val * {"Seconds": 1, "Minutes": 60, "Hours": 3600, "Days": 86_400}[unit]
 
-
 INV_SEC   = _interval("Inventory refill", 30)
-SHELF_SEC = _interval("Shelf refill", 10)
+SHELF_SEC = _interval("Shelf refill",    10)
 
-# ───────────── SESSION STATE ─────────────
+# session state -----------------------------------------------------------
 defaults = dict(
     unified_run=False,
-    # POS timing
     real_ts=time.time(),
     sim_clock=datetime.now(),
     next_sale_times=[],
     sales_count=0,
     pos_log=[],
     shortage_log=[],
-    # Inventory
     inv_last_ts=time.time() - INV_SEC,
     inv_cycles=0,
     last_inv_rows=0,
     inv_all_logs=[],
-    # Shelf
     sh_last_ts=time.time() - SHELF_SEC,
     sh_cycles=0,
     last_sh_rows=0,
@@ -79,6 +73,7 @@ for k, v in defaults.items():
 
 RUN = st.session_state["unified_run"]
 
+# start / stop buttons ----------------------------------------------------
 b1, b2 = st.columns(2)
 if b1.button("▶ Start", disabled=RUN):
     now = datetime.now()
@@ -105,7 +100,7 @@ if b2.button("⏹ Stop", disabled=not RUN):
     st.session_state.unified_run = False
     RUN = False
 
-# ───────────── HANDLERS & CATALOG ─────────────
+# handlers & static catalogue --------------------------------------------
 POS   = POSHandler()
 INV   = InventoryHandler()
 SHELF = SellingAreaHandler()
@@ -122,7 +117,7 @@ def catalogue() -> pd.DataFrame:
 
 CAT = catalogue()
 
-# ───────────── HELPERS ─────────────
+# helper fns --------------------------------------------------------------
 def random_cart() -> list[dict]:
     n_avail = len(CAT)
     if n_avail == 0:
@@ -139,29 +134,22 @@ def random_cart() -> list[dict]:
         for _, r in picks.iterrows()
     ]
 
-
 def base_interval(sim_dt: datetime) -> float:
     if PROFILE.startswith("Standard"):
         return 120.0
     h = sim_dt.hour
-    if 6 <= h < 10:
-        return 180
-    if 10 <= h < 14:
-        return 90
-    if 14 <= h < 18:
-        return 60
-    if 18 <= h < 22:
-        return 40
+    if 6 <= h < 10:  return 180
+    if 10 <= h < 14: return 90
+    if 14 <= h < 18: return 60
+    if 18 <= h < 22: return 40
     return 240
-
 
 def next_gap(sim_dt: datetime) -> float:
     return base_interval(sim_dt) / SPEED
 
-
-# ───────────── INVENTORY & SHELF CYCLES ─────────────
+# inventory cycle ---------------------------------------------------------
 def inventory_cycle() -> int:
-    snap = INV.stock_levels()
+    snap  = INV.stock_levels()
     below = snap[snap.totalqty < snap.threshold].copy()
     if below.empty:
         return 0
@@ -170,38 +158,28 @@ def inventory_cycle() -> int:
     st.session_state.inv_all_logs.extend(logs)
     return len(logs)
 
-
+# shelf cycle -------------------------------------------------------------
 def shelf_cycle() -> int:
-    """
-    Uses the **exact same refill mechanics** as the dedicated 'Shelf Auto‑Refill'
-    page, but runs silently inside the unified POS loop.
-    Returns the number of items that were topped‑up this pass.
-    """
     below = SHELF.get_items_below_shelfthreshold()
-    if below.empty:
+    if below.empty():
         return 0
 
-    moved_items = 0
-    log_entries = []
-    USER = "AUTO‑UNIFIED"
-    DUMMY_SALEID = 0
+    USER, DUMMY_SALEID = "AUTO‑UNIFIED", 0
+    moved, log_entries = 0, []
 
     for row in below.itertuples(index=False):
-        # How many units do we need?
         need = max(row.shelfaverage - row.totalquantity,
                    row.shelfthreshold - row.totalquantity)
-
-        # Clear historical shortages first
         need = SHELF.resolve_shortages(itemid=row.itemid, qty_need=need, user=USER)
         if need <= 0:
             continue
 
         layers = SHELF.fetch_data(
             """
-            SELECT expirationdate, quantity, cost_per_unit
+            SELECT batchid, expirationdate, quantity, cost_per_unit
               FROM inventory
              WHERE itemid = %s AND quantity > 0
-          ORDER BY expirationdate, cost_per_unit
+          ORDER BY expirationdate, cost_per_unit, batchid
             """,
             (row.itemid,),
         )
@@ -212,7 +190,10 @@ def shelf_cycle() -> int:
                 break
             take = min(need, int(lyr.quantity))
             if take:
-                plan.append((lyr.expirationdate, take, float(lyr.cost_per_unit)))
+                plan.append(
+                    (int(lyr.batchid), lyr.expirationdate, take,
+                     float(lyr.cost_per_unit))
+                )
                 need -= take
 
         if plan:
@@ -221,7 +202,7 @@ def shelf_cycle() -> int:
                 layers=plan,
                 created_by=USER,
             )
-            moved_items += 1
+            moved += 1
             log_entries.append(
                 dict(
                     itemid=row.itemid,
@@ -242,17 +223,16 @@ def shelf_cycle() -> int:
             )
 
     st.session_state.sh_all_logs.extend(log_entries)
-    return moved_items  #  how many different items were refilled
+    return moved      # number of different items refilled
 
-
-# ───────────── MAIN LOOP ─────────────
+# main loop ---------------------------------------------------------------
 if RUN:
     now_real = time.time()
     elapsed  = now_real - st.session_state.real_ts
     st.session_state.real_ts = now_real
     st.session_state.sim_clock += timedelta(seconds=elapsed * SPEED)
 
-    # ---- Collect due sales -------------------------------------------------
+    # sales due ------------------------------------------------------------
     pending_sales: List[dict] = []
     for idx, nxt in enumerate(st.session_state.next_sale_times):
         while nxt <= st.session_state.sim_clock:
@@ -270,7 +250,7 @@ if RUN:
             nxt += timedelta(seconds=next_gap(nxt))
         st.session_state.next_sale_times[idx] = nxt
 
-    # ---- Bulk‑process ------------------------------------------------------
+    # process sales --------------------------------------------------------
     if pending_sales:
         try:
             batch_log = POS.process_sales_batch(pending_sales)
@@ -285,7 +265,7 @@ if RUN:
             POS.conn.rollback()
             st.error("POS batch error:\n" + "".join(traceback.format_exc(limit=1)))
 
-    # ---- Inventory & Shelf refills ----------------------------------------
+    # inventory / shelf refills -------------------------------------------
     if now_real - st.session_state.inv_last_ts >= INV_SEC:
         try:
             st.session_state.last_inv_rows = inventory_cycle()
@@ -302,12 +282,12 @@ if RUN:
             st.error("Shelf error:\n" + "".join(traceback.format_exc(limit=1)))
         st.session_state.sh_last_ts = now_real
 
-    # ---- UI metrics & logs -------------------------------------------------
+    # UI -------------------------------------------------------------------
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("POS")
-        st.metric("Total sales", st.session_state.sales_count)
-        st.metric("Sim time", f"{st.session_state.sim_clock:%F %T}")
+        st.metric("Total sales",  st.session_state.sales_count)
+        st.metric("Sim time",     f"{st.session_state.sim_clock:%F %T}")
     with col2:
         st.subheader("Automation")
         st.metric("Inv rows last",   st.session_state.last_inv_rows)
@@ -334,38 +314,34 @@ if RUN:
                     f"Sale {entry['saleid']} at {entry['timestamp']} "
                     f"(Cashier: {entry['cashier']})"
                 ):
-                    st.write("Items:")
                     st.dataframe(pd.DataFrame(entry["items"]))
                     if entry["shortages"]:
-                        st.write("Shortages in this sale:")
+                        st.write("Shortages:")
                         st.dataframe(pd.DataFrame(entry["shortages"]))
-                    else:
-                        st.write("No shortages for this sale.")
         else:
             st.write("No sales yet.")
 
     with tab2:
         st.subheader("All Shortages this session")
-        if st.session_state.shortage_log:
-            st.dataframe(pd.DataFrame(st.session_state.shortage_log))
-        else:
-            st.write("No shortages so far.")
+        st.dataframe(pd.DataFrame(st.session_state.shortage_log)
+                     if st.session_state.shortage_log else
+                     pd.DataFrame({"info": ["No shortages so far."]}),
+                     use_container_width=True)
 
     with tab3:
-        st.subheader("Inventory Auto‑Refill (all cycles)")
-        if st.session_state.inv_all_logs:
-            st.dataframe(pd.DataFrame(st.session_state.inv_all_logs))
-        else:
-            st.write("No inventory auto‑refills yet.")
+        st.subheader("Inventory Auto‑Refill")
+        st.dataframe(pd.DataFrame(st.session_state.inv_all_logs)
+                     if st.session_state.inv_all_logs else
+                     pd.DataFrame({"info": ["No inventory auto‑refills."]}),
+                     use_container_width=True)
 
     with tab4:
-        st.subheader("Shelf Auto‑Refill (all cycles)")
-        if st.session_state.sh_all_logs:
-            st.dataframe(pd.DataFrame(st.session_state.sh_all_logs))
-        else:
-            st.write("No shelf auto‑refills yet.")
+        st.subheader("Shelf Auto‑Refill")
+        st.dataframe(pd.DataFrame(st.session_state.sh_all_logs)
+                     if st.session_state.sh_all_logs else
+                     pd.DataFrame({"info": ["No shelf auto‑refills."]}),
+                     use_container_width=True)
 
-    # ---- Refresh loop ------------------------------------------------------
     time.sleep(0.2)
     st.rerun()
 else:
